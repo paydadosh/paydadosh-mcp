@@ -1,0 +1,72 @@
+{
+ "checked_words": 8,
+ "errors": 2,
+ "issues": [
+  {
+   "word": "гулакх",
+   "start": 27,
+   "end": 33,
+   "kind": "error",
+   "suggestions": [
+    "гӏулакх",
+    "гӏулакха",
+    "гӏулакхаш",
+    "гӏулакхах"
+   ],
+   "analyses": [
+    {
+     "lemma": "гул",
+     "pos": "сущ.",
+     "note": ""
+    }
+   ]
+  },
+  {
+   "word": "магазин",
+   "start": 34,
+   "end": 41,
+   "kind": "russian",
+   "suggestions": [],
+   "ingush_equivalent": "тика",
+   "analyses": [
+    {
+     "lemma": "магазин",
+     "pos": "сущ.",
+     "note": ""
+    }
+   ]
+  },
+  {
+   "word": "кIант",
+   "start": 42,
+   "end": 47,
+   "kind": "palochka",
+   "suggestions": [
+    "кӏант"
+   ],
+   "analyses": [
+    {
+     "lemma": "кӀант",
+     "pos": "сущ.",
+     "note": ""
+    },
+    {
+     "lemma": "кӀант",
+     "pos": "сущ.",
+     "note": "им.п."
+    }
+   ]
+  }
+ ],
+ "grammar": [
+  {
+   "word": "гулакх",
+   "start": 27,
+   "end": 33,
+   "message": "пропущена палочка: гӏулакх",
+   "suggestion": "гӏулакх"
+  }
+ ],
+ "phrase": null,
+ "dictionary_version": "v132"
+}

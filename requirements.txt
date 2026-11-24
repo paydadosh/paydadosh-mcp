@@ -1,0 +1,14 @@
+# Own environment of the MCP service — not the PaydaDosh site's: `mcp` brings its own starlette / pydantic.
+# Versions are pinned and at least two weeks old as of 2026-10-22; tested locally on Python 3.11
+# (CI and production run 3.12).
+# `mcp` 2.x renamed FastMCP to MCPServer — moving to it is a separate task.
+mcp==1.30.0
+httpx==0.28.1
+uvicorn==0.54.0
+# transitive packages that define the server's behaviour
+starlette==1.7.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+sse-starlette==3.5.0
+anyio==4.15.1
+# tests: pip install pytest==9.1.1 (not needed in production)

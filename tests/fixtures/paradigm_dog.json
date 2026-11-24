@@ -1,0 +1,336 @@
+{
+ "q": "дог",
+ "main": {
+  "lemma": "дог",
+  "pos": "сущ.",
+  "pos_raw": "NOUN",
+  "is_form": false,
+  "level": "ok",
+  "method": "словарь",
+  "segments": [],
+  "entry_id": 104869,
+  "gloss": "сердце",
+  "desc": "Именительный — субъект (кто? что?): мала? фу?",
+  "also": [],
+  "path": "/word/104869-дог"
+ },
+ "others": [
+  {
+   "lemma": "дага",
+   "pos": "глаг.",
+   "pos_raw": "VERB",
+   "gloss": "",
+   "note": "",
+   "method": "словарь",
+   "level": "ok",
+   "entry_id": null
+  },
+  {
+   "lemma": "дагар",
+   "pos": "глаг.",
+   "pos_raw": "VERB",
+   "gloss": "Вышивать. • ега кий jegaa kii Woman’s appliqueed cylindri…",
+   "note": "наст.вр.",
+   "method": "курир. форма",
+   "level": "ok",
+   "entry_id": 62193,
+   "path": "/word/62193-дагар"
+  }
+ ],
+ "paradigm": {
+  "lemma": "дог",
+  "kind": "noun",
+  "kind_ru": "существительное",
+  "rows": [
+   {
+    "slot": "Nom",
+    "label": "Им.",
+    "forms": [
+     {
+      "form": "дог",
+      "tier": "dictionary",
+      "hit": true
+     }
+    ],
+    "label_ing": "цӏера дожар",
+    "question": "мала? фу?"
+   },
+   {
+    "slot": "Gen",
+    "label": "Род.",
+    "forms": [
+     {
+      "form": "дега",
+      "tier": "dictionary"
+     }
+    ],
+    "label_ing": "доала дожар",
+    "question": "хьан? сен?"
+   },
+   {
+    "slot": "Dat",
+    "label": "Дат.",
+    "forms": [
+     {
+      "form": "дега",
+      "tier": "rule"
+     }
+    ],
+    "label_ing": "лура дожар",
+    "question": "хьанна? сенна?"
+   },
+   {
+    "slot": "Erg",
+    "label": "Эрг.",
+    "forms": [
+     {
+      "form": "дего",
+      "tier": "dictionary"
+     }
+    ],
+    "label_ing": "дера дожар",
+    "question": "хьан? сево?"
+   },
+   {
+    "slot": "Com",
+    "label": "Совм.",
+    "forms": [
+     {
+      "form": "дегаца",
+      "tier": "dictionary"
+     }
+    ],
+    "label_ing": "кечала дожар",
+    "question": "хьанца? сенца?"
+   },
+   {
+    "slot": "Subst",
+    "label": "Веществ.",
+    "forms": [
+     {
+      "form": "дегах",
+      "tier": "dictionary"
+     }
+    ],
+    "label_ing": "хотталура дожар",
+    "question": "хьанах? сенах?"
+   },
+   {
+    "slot": "Loc",
+    "label": "Местн.",
+    "forms": [
+     {
+      "form": "дегага",
+      "tier": "dictionary"
+     }
+    ],
+    "label_ing": "меттига дожар",
+    "question": "мича? хьанга? сенга?"
+   },
+   {
+    "slot": "All",
+    "label": "Местн. 2 (куда)",
+    "forms": [
+     {
+      "form": "дегагахьа",
+      "tier": "rule"
+     }
+    ],
+    "label_ing": "2-гӀа дӀадерзара форма",
+    "question": "хьангахьа? сенгахьа?"
+   },
+   {
+    "slot": "Ela",
+    "label": "Местн. 3 (откуда)",
+    "forms": [
+     {
+      "form": "дегагара",
+      "tier": "rule"
+     }
+    ],
+    "label_ing": "1-ра хьадалара форма",
+    "question": "мичара? хьангара? сенгара?"
+   },
+   {
+    "slot": "Ela2",
+    "label": "Местн. 4 (откуда от)",
+    "forms": [
+     {
+      "form": "дегагахьара",
+      "tier": "rule"
+     }
+    ],
+    "label_ing": "2-гӀа хьадалара форма",
+    "question": "мичахьара? хьангахьара? сенгахьара?"
+   },
+   {
+    "slot": "Cmpr",
+    "label": "Сравн.",
+    "forms": [
+     {
+      "form": "дегал",
+      "tier": "dictionary"
+     }
+    ],
+    "label_ing": "дустара дожар",
+    "question": "хьанал? сенал?"
+   },
+   {
+    "slot": "Plur",
+    "label": "Мн. ч.",
+    "forms": [
+     {
+      "form": "дегаш",
+      "tier": "dictionary"
+     }
+    ],
+    "label_ing": "дукхален таьрахь",
+    "question": "мала? фу? (дукх.)"
+   },
+   {
+    "slot": "GenPl",
+    "label": "Род. мн.",
+    "forms": [
+     {
+      "form": "дегий",
+      "tier": "rule"
+     }
+    ],
+    "label_ing": "доала дожар (дукх.)",
+    "question": "хьан? сен? (дукх.)"
+   },
+   {
+    "slot": "DatPl",
+    "label": "Дат. мн.",
+    "forms": [
+     {
+      "form": "дегашта",
+      "tier": "rule"
+     }
+    ],
+    "label_ing": "лура дожар (дукх.)",
+    "question": "хьанна? сенна? (дукх.)"
+   },
+   {
+    "slot": "ErgPl",
+    "label": "Эрг. мн.",
+    "forms": [
+     {
+      "form": "дегаша",
+      "tier": "rule"
+     }
+    ],
+    "label_ing": "дера дожар (дукх.)",
+    "question": "хьан? сево? (дукх.)"
+   },
+   {
+    "slot": "ComPl",
+    "label": "Совм. мн.",
+    "forms": [
+     {
+      "form": "дегашца",
+      "tier": "rule"
+     }
+    ],
+    "label_ing": "кечала дожар (дукх.)",
+    "question": "хьанца? сенца? (дукх.)"
+   },
+   {
+    "slot": "SubstPl",
+    "label": "Веществ. мн.",
+    "forms": [
+     {
+      "form": "дегех",
+      "tier": "rule"
+     }
+    ],
+    "label_ing": "хотталура дожар (дукх.)",
+    "question": "хьанах? сенах? (дукх.)"
+   },
+   {
+    "slot": "LocPl",
+    "label": "Местн. мн.",
+    "forms": [
+     {
+      "form": "дегашка",
+      "tier": "rule"
+     }
+    ],
+    "label_ing": "меттига дожар (дукх.)",
+    "question": "мича? хьанга? сенга? (дукх.)"
+   },
+   {
+    "slot": "CmprPl",
+    "label": "Сравн. мн.",
+    "forms": [
+     {
+      "form": "дегел",
+      "tier": "rule"
+     }
+    ],
+    "label_ing": "дустара дожар (дукх.)",
+    "question": "хьанал? сенал? (дукх.)"
+   }
+  ],
+  "noun_class": {
+   "raw": "д, д",
+   "singular": [
+    "д"
+   ],
+   "plural": "д"
+  }
+ },
+ "examples": {
+  "total": 999,
+  "needle": "дог",
+  "rows": [
+   {
+    "ing": "лома дог",
+    "ru": "Львиное сердце.",
+    "code": "ОМО07",
+    "page": "1",
+    "prov": "pub"
+   },
+   {
+    "ing": "дика дог",
+    "ru": "до́брое се́рдце",
+    "code": "ОЗД80",
+    "page": "158",
+    "prov": "pub"
+   },
+   {
+    "ing": "хена дог",
+    "ru": "сердцеви́на де́рева",
+    "code": "ОЗД80",
+    "page": "660",
+    "prov": "pub"
+   }
+  ]
+ },
+ "articles": [
+  {
+   "entry_id": 103989,
+   "term": "Дага",
+   "pos": "глаг.",
+   "gloss": "вышить, вышивать",
+   "path": "/word/103989-дага"
+  },
+  {
+   "entry_id": 103990,
+   "term": "Дага",
+   "pos": "глаг.",
+   "gloss": "гореть",
+   "path": "/word/103990-дага"
+  },
+  {
+   "entry_id": 12342,
+   "term": "да́гар (д)",
+   "pos": "сущ.",
+   "gloss": "горение",
+   "path": "/word/12342-да-гар"
+  }
+ ],
+ "miss": false,
+ "hypothesis": null,
+ "suggestions": []
+}

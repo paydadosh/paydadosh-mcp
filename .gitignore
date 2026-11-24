@@ -1,0 +1,10 @@
+# call log (daily files) and local environment — never in git
+data/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+requirements.lock
+.env
+*.pem
