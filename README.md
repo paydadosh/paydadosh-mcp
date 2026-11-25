@@ -33,7 +33,7 @@ Inspect it by hand: `npx @modelcontextprotocol/inspector` → transport *Streama
 | `get_paradigm` | The full inflection table; every form has a reliability tier: `verified`, `dictionary`, `corpus`, `rule` (generated, may be wrong), `auto`; verb rows carry the class row `cls` {в, й, б, д}, nouns — `noun_class` (singular / plural); `main_only` for the principal rows | `дог`, `ала` (verb) |
 | `find_examples` | Up to 5 corpus sentences with translation and source (first page only) | `бӀаргаш` |
 | `translation_context` | What the site's own assistant reads before answering a question: native-speaker corrections, phrasebook, parallel sentences, dictionary entries, grammar notes, answers from the Q&A section «Хаттараш». Call it first for phrase translation | `Как сказать «я хочу домой»?` |
-| `check_ingush_text` | Verify an Ingush text word by word (typically the assistant's own draft) with the same check the site's assistant applies to its answers: `confirmed` / `unverified` (likely invented, with suggestions); unverifiable quotes; card link only when unambiguous | `Сона хьо веза, хьо са дог ва` |
+| `check_ingush_text` | Verify an Ingush text word by word (typically the assistant's own draft) with the same check the site's assistant applies to its answers: `confirmed` / `unverified` (likely invented, with suggestions); unverifiable quotes; card link only when unambiguous | `Сона хьо веза, хьо са дог да` |
 | `check_spelling` | Spell-check a person's text: errors with suggestions, wrong palochka letter, class agreement | `Со гӀалгӀай ва` |
 
 Prompt: `ingush_assistant` ("Ingush assistant / Ингушский помощник") — which tool first, never invent forms,

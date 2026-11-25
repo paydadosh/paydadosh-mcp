@@ -1147,7 +1147,7 @@ async def check_ingush_text(
     ctx: Context,
     text: Annotated[str, Field(min_length=1, max_length=5000, description=(
         "Ingush text to verify — typically your own draft answer; Russian words in it are recognised and "
-        "skipped. The first 1000 characters are checked. E.g. «Сона хьо веза, хьо са дог ва»."))],
+        "skipped. The first 1000 characters are checked. E.g. «Сона хьо веза, хьо са дог да»."))],
 ) -> ToolOut:
     t, truncated = _text_arg(text)
 
@@ -1229,7 +1229,7 @@ TOOLS: list[tuple[Callable[..., Any], str, str, str]] = [
         "come with the analyzer's reading (lemma, part of speech, note), and with a gloss and card link only "
         "when the card is unambiguous. Quotes attributed to a source that are not in the data are listed in "
         "unverified_quotes. Replace or flag every unverified word instead of presenting it as Ingush. Example: "
-        "«Сона хьо веза, хьо са дог ва». Only the unverified words are kept in our log, not the text.")),
+        "«Сона хьо веза, хьо са дог да». Only the unverified words are kept in our log, not the text.")),
     (check_spelling, "check_spelling", "Spell-check Ingush text", (
         "Spell-check a person's Ingush text (up to 1000 characters) with the PaydaDosh spelling dictionary. "
         "Returns each problematic word with its position, kind (error; palochka typed with a wrong letter; "

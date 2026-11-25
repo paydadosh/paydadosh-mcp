@@ -418,7 +418,7 @@ def test_every_tool_end_to_end(client, site, tmp_path):
     res = call(client, "translation_context", {"question": "Как ты себя чувствуешь?"})
     assert res["structuredContent"]["native_corrections"]
     assert site.timeouts[-1] == srv.CONTEXT_TIMEOUT                      # у контекста свой таймаут
-    res = call(client, "check_ingush_text", {"text": "Сона хьо веза, хьо са дог ва. Со тахан цӀагӀа хургвац, хьозазаза."})
+    res = call(client, "check_ingush_text", {"text": "Сона хьо веза, хьо са дог да. Со тахан цӀагӀа хургвац, хьозазаза."})
     assert res["structuredContent"]["unknown_words"] == ["хьозазаза"]
     res = call(client, "check_spelling", {"text": "Со гӀалгӀай ва гулакх"})
     assert res["structuredContent"]["found"] is True

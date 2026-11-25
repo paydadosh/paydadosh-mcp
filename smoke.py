@@ -32,7 +32,7 @@ CHECKS = [
     ("get_paradigm", {"word": "ала", "part_of_speech": "verb"}, "аьлар"),
     ("find_examples", {"word": "дог"}, "дог"),
     ("translation_context", {"question": "Как ты себя чувствуешь?"}, "хьона"),
-    ("check_ingush_text", {"text": "Сона хьо веза, хьо са дог ва. хьозазаза"}, "хьозазаза"),
+    ("check_ingush_text", {"text": "Сона хьо веза, хьо са дог да. хьозазаза"}, "хьозазаза"),
     ("check_spelling", {"text": "Со гIалгIай ва, гулакх"}, "гӀулакх"),
 ]
 REPORT_TOOLS = {"search_dictionary", "analyze_word", "get_paradigm"}   # у найденного — форма ошибки карточки
