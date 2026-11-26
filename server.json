@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "ru.paydadosh/dictionary",
   "title": "PaydaDosh — Ingush dictionary",
-  "description": "Ingush–Russian dictionary: lookup, word analysis, paradigms, corpus examples, text checks",
-  "version": "1.1.1",
+  "description": "Ingush–Russian dictionary: lookup, paradigms, corpus, draft translation, numbers, text checks",
+  "version": "1.2.0",
   "websiteUrl": "https://paydadosh.ru/developers",
   "remotes": [
     {

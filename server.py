@@ -3,20 +3,27 @@
 Маленькая отдельная служба: слушает свой порт (по умолчанию 127.0.0.1:8010, снаружи — через обратный прокси),
 данные берёт у сайта PaydaDosh по его внутреннему HTTP (`MCP_SITE_API`) и ничего из кода сайта не импортирует:
 
-* `GET  /api/mcp-feed/v1/search`     — словарь;
-* `GET  /api/mcp-feed/v1/razbor`     — разбор слова и таблица форм с ярусом достоверности формы;
-* `POST /api/mcp-feed/v1/spell`      — проверка орфографии;
-* `GET  /api/mcp-feed/v1/context`    — контекст перевода (словарь, корпус, разговорник, грамматика, ответы носителей);
-* `POST /api/mcp-feed/v1/check-text` — каждое слово текста: известно ли словарю и чья это форма;
-* `GET  /api/app/v1/corpus`          — примеры из корпуса (первая страница, берём ≤ 5 строк).
+* `GET  /api/mcp-feed/v1/search`            — словарь;
+* `GET  /api/mcp-feed/v1/razbor`            — разбор слова и таблица форм с ярусом достоверности формы;
+* `POST /api/mcp-feed/v1/spell`             — проверка орфографии;
+* `GET  /api/mcp-feed/v1/context`           — контекст перевода (словарь, корпус, разговорник, грамматика, ответы носителей);
+* `POST /api/mcp-feed/v1/check-text`        — каждое слово текста: известно ли словарю и чья это форма;
+* `GET  /api/mcp-feed/v1/semantic-examples` — примеры из корпуса по смыслу (≤ 5 строк);
+* `POST /api/mcp-feed/v1/translate-draft`   — черновик машинного перевода с автопроверкой ингушских слов;
+* `POST /api/mcp-feed/v1/search-batch`      — пакетный поиск (≤ 50 слов, по слову — лучшая статья);
+* `GET  /api/mcp-feed/v1/numbers`           — число прописью (количественное, порядковое, классы);
+* `POST /api/mcp-feed/v1/report`            — сообщение об ошибке в очередь модераторов (единственная запись);
+* `GET  /api/mcp-feed/v1/traps`             — частые ошибки моделей (только при MCP_EXPOSE_TRAPS=1);
+* `GET  /api/app/v1/corpus`                 — примеры из корпуса (первая страница, берём ≤ 5 строк).
 
-Рассуждает модель пользователя — сервер отдаёт только данные, никаких LLM на нашей стороне. Наружу не выходит
-ничего пишущего и никаких имён модераторов. Транспорт — Streamable HTTP без состояния (`stateless_http=True`,
+Рассуждает модель пользователя — сервер отдаёт только данные, никаких LLM на нашей стороне. Пишет сервер
+одно — сообщение об ошибке (report_error) в очередь редакции, с потолками; имён модераторов наружу нет. Транспорт — Streamable HTTP без состояния (`stateless_http=True`,
 `json_response=True`): каждый запрос самодостаточен, перезапуск службы не рвёт ничьих сессий.
 
 Журнал вызовов — `data/mcp_calls-ГГГГ-ММ-ДД.jsonl` (файл на день, хранится `MCP_LOG_RETENTION_DAYS` = 90 дней):
 время, инструмент, запрос (≤ 300 знаков у поиска и контекста, ≤ 64 у остальных; у проверок текста — только
-незнакомые словарю слова и длина), found, мс, клиент, хэш IP с солью `MCP_IP_SALT`. Отчёт — `mcp_stats.py`.
+незнакомые словарю слова и длина; у черновика перевода текст — только если он ≤ 60 знаков; у пакетного поиска —
+первые 64 знака списка и до 30 ненайденных слов; у сообщения об ошибке — слово и длина), found, мс, клиент, хэш IP с солью `MCP_IP_SALT`. Отчёт — `mcp_stats.py`.
 
 Запуск: `python server.py` (или `uvicorn server:app --host 127.0.0.1 --port 8010`).
 """
@@ -45,11 +52,11 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.prompts.base import Prompt
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, Icon, ResourceLink, TextContent, ToolAnnotations
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 HERE = Path(__file__).resolve().parent
 log = logging.getLogger("paydadosh.mcp")
 
@@ -66,14 +73,41 @@ LOG_DIR = Path(_env("MCP_LOG_DIR", str(HERE / "data")))
 RETENTION_DAYS = int(_env("MCP_LOG_RETENTION_DAYS", "90"))
 API_TIMEOUT = float(_env("MCP_API_TIMEOUT", "8"))           # секунд на вызов сайта
 CONTEXT_TIMEOUT = float(_env("MCP_CONTEXT_TIMEOUT", "15"))  # контекст перевода собирается дольше
+MT_TIMEOUT = float(_env("MCP_MT_TIMEOUT", "18"))            # черновик перевода с автопроверкой слов
+BATCH_TIMEOUT = float(_env("MCP_BATCH_TIMEOUT", "25"))      # пакетный поиск до 50 слов
 SITE_CONCURRENCY = int(_env("MCP_SITE_CONCURRENCY", "2"))   # одновременных вызовов сайта, не больше
+# Перевод — своя очередь в 1 место: сервис перевода один на весь сайт и медленный, общий SITE_CONCURRENCY он
+# занимал бы целиком, и search_dictionary стоял бы за ним в очереди.
+MT_CONCURRENCY = int(_env("MCP_MT_CONCURRENCY", "1"))
 CONTEXT_PER_MINUTE = int(_env("MCP_CONTEXT_PER_MINUTE", "20"))  # translation_context с одного адреса
+SEMANTIC_PER_MINUTE = int(_env("MCP_SEMANTIC_PER_MINUTE", "20"))  # find_examples(mode=semantic) с одного адреса
+MT_PER_MINUTE = int(_env("MCP_MT_PER_MINUTE", "10"))            # translate_draft с одного адреса
+# Общий потолок переводов на ВЕСЬ сервер (все клиенты вместе): анонимная нагрузка на единственный сервер перевода
+MT_GLOBAL_PER_MINUTE = int(_env("MCP_MT_GLOBAL_PER_MINUTE", "20"))
+MT_GLOBAL_PER_DAY = int(_env("MCP_MT_GLOBAL_PER_DAY", "500"))
+REPORTS_PER_HOUR = int(_env("MCP_REPORTS_PER_HOUR", "5"))       # report_error с одного адреса в час
+REPORTS_PER_DAY = int(_env("MCP_REPORTS_PER_DAY", "50"))        # report_error на весь сервер в сутки
+BATCH_MAX = 50                                                  # слов в search_terms
+# search_terms: ⌈N/5⌉ единиц на вызов; 20 единиц = 100 слов в минуту с адреса (ревью 27.11: было 300)
+BATCH_UNITS_PER_MINUTE = int(_env("MCP_BATCH_UNITS_PER_MINUTE", "20"))
+# Пакеты — своя очередь к сайту в 1 место (как перевод): пакет держит вызов до 25 с и не должен занимать места
+# словаря (SITE_CONCURRENCY); на сайте пакеты тоже идут по одному.
+BATCH_CONCURRENCY = int(_env("MCP_BATCH_CONCURRENCY", "1"))
+# Поиск по смыслу (find_examples mode=semantic): общий потолок на весь сервер — кодировщик стоит на той же
+# единственной машине, что и переводчик. Добор параллелей translation_context сайт считает в своём потолке.
+SEMANTIC_GLOBAL_PER_MINUTE = int(_env("MCP_SEMANTIC_GLOBAL_PER_MINUTE", "30"))
+SEMANTIC_GLOBAL_PER_DAY = int(_env("MCP_SEMANTIC_GLOBAL_PER_DAY", "2000"))
+EXPOSE_TRAPS = _env("MCP_EXPOSE_TRAPS", "0") == "1"             # «Частые ошибки моделей» в подсказке — не решено
 # X-Real-IP верим только от своего прокси (служба может слушать сеть, не только 127.0.0.1); иначе — адрес соединения
 TRUSTED_PROXIES = {x.strip() for x in _env("MCP_TRUSTED_PROXIES", "127.0.0.1").split(",") if x.strip()}
 # Общие адреса облачных клиентов: все пользователи Claude.ai приходят с этих сетей — лимит «на адрес» для них выше
 SHARED_EGRESS = [ipaddress.ip_network(x.strip(), strict=False) for x in
                  _env("MCP_SHARED_EGRESS_CIDRS", "160.79.104.0/21,153.61.208.0/20").split(",") if x.strip()]
 SHARED_CONTEXT_PER_MINUTE = int(_env("MCP_SHARED_CONTEXT_PER_MINUTE", "200"))
+SHARED_MT_PER_MINUTE = int(_env("MCP_SHARED_MT_PER_MINUTE", "60"))
+SHARED_SEMANTIC_PER_MINUTE = int(_env("MCP_SHARED_SEMANTIC_PER_MINUTE", "200"))
+SHARED_REPORTS_PER_HOUR = int(_env("MCP_SHARED_REPORTS_PER_HOUR", "30"))
+SHARED_BATCH_UNITS_PER_MINUTE = int(_env("MCP_SHARED_BATCH_UNITS_PER_MINUTE", "60"))
 LOG_MAX_BYTES_PER_DAY = int(float(_env("MCP_LOG_MAX_MB_PER_DAY", "50")) * 1024 * 1024)
 QUEUE_TIMEOUT = 10.0                                        # сколько ждать своей очереди к сайту
 CACHE_TTL = 600.0                                           # кэш одинаковых вызовов — 10 минут
@@ -81,21 +115,31 @@ CACHE_MAX = 2000
 MAX_RESULT_BYTES = 20_000                                   # ответ инструмента ≤ ~20 КБ
 MAX_BODY_BYTES = 64 * 1024                                  # тело запроса MCP
 TEXT_MAX = 1000                                             # знаков текста на проверку
+MT_TEXT_MAX = 400                                           # знаков текста на черновик перевода
 EXAMPLES_MAX = 5                                            # корпус: не больше 5 предложений, 1-я страница
 EXAMPLE_CHARS = 300
 LOG_Q_LONG = {"search_dictionary", "translation_context"}   # у них запрос в журнале — до 300 знаков
+LOG_TEXT_SHORT = 60                                         # translate_draft: текст в журнал — только такой длины
+REPORT_TEXT_MAX = 1000
 LINK_PROTOCOL = "2025-06-18"                                # с этой версии протокола есть resource_link
 
 INSTRUCTIONS = """\
 PaydaDosh — Ingush dictionary (paydadosh.ru): an Ingush–Russian dictionary with tens of thousands of \
 headwords merged from dozens of printed dictionaries, Ozdoev's Russian–Ingush dictionary, a corpus of \
-Ingush texts with Russian translations, a morphological analyzer and a spell-checker.
+Ingush texts with Russian translations (lexical and meaning-based search), a morphological analyzer, \
+a spell-checker and a neural draft translator.
 
 How to answer:
 1. Phrase or "how do you say…": call translation_context first — native-speaker corrections there are the \
-reference, phrasebook and corpus pairs come next; single words — search_dictionary; forms — get_paradigm.
+reference, phrasebook and corpus pairs come next; single words — search_dictionary; forms — get_paradigm. \
+For translating a full sentence or short text you may also call translate_draft for a machine-translation \
+draft (with automatic word verification), and find_examples(mode="semantic") to look up meaning-matched \
+corpus examples. Many words at once — search_terms; numbers — number_to_words.
 2. Take Ingush words and forms ONLY from tool results. found=false means PaydaDosh has no such word: say so, \
-do not invent or "reconstruct" a form. Check your own Ingush text with check_ingush_text before answering.
+do not invent or "reconstruct" a form; `suggestions` are only «возможно, имелось в виду» — check them. \
+translate_draft output is ALWAYS a draft (draft=true): machine translation, not checked by a native speaker — \
+say so next to it, never present it as a dictionary fact; replace or flag unverified words and check your own \
+Ingush text with check_ingush_text before answering.
 3. Give the user a paydadosh.ru link (`url`) for EVERY Ingush word or form in your answer, and cite the \
 source code (БДИМТ09, КУР05, ОЗД80…). If an entry or meaning has exactly ONE code in `sources`, say so right \
 next to it, e.g. «(только в БДИМТ09)»: one printed dictionary is weaker evidence than several.
@@ -103,12 +147,13 @@ next to it, e.g. «(только в БДИМТ09)»: one printed dictionary is w
 confidence=hypothesis are unverified — say so. Palochka is Ӏ (U+04C0); in queries I, 1, l or | also work.
 5. If the user says a form or translation is wrong, give them the item's `report_url` — the error form on \
 the paydadosh.ru word page («сообщить об ошибке на paydadosh.ru»); a word without a card — the site's \
-feedback form https://paydadosh.ru/#feedback-form. Never report anything yourself: this server is read-only \
-and accepts no reports.
+feedback form https://paydadosh.ru/#feedback-form. Call report_error yourself ONLY when the user explicitly \
+asks you to send the report, with their own description and no personal data; never report on your own \
+initiative and never promise a fix.
 6. Definitions and notes are in Russian, as on the site. The prompt "ingush_assistant" has the full rules.
 
-Tools: search_dictionary, analyze_word, get_paradigm, find_examples, translation_context, \
-check_ingush_text, check_spelling.\
+Tools: search_dictionary, search_terms, analyze_word, get_paradigm, find_examples, translation_context, \
+translate_draft, number_to_words, check_ingush_text, check_spelling, report_error.\
 """
 
 # Подсказка «Ингушский помощник»: сжатые правила помощника сайта (порядок источников и главные ловушки).
@@ -119,16 +164,25 @@ ASSISTANT_RULES = """\
 ПОРЯДОК РАБОТЫ
 1. Перевод фразы, «как сказать…» — сначала translation_context. В нём: правки носителей (эталон — бери
    дословно), разговорник (готовые фразы; повод в occasion должен совпадать с запросом), пары из корпуса,
-   словарь, грамматика, ответы носителей в «Хаттараш».
+   словарь, грамматика, ответы носителей в «Хаттараш»; ready_answers — готовый ответ на этот самый запрос
+   (use=verbatim — бери дословно; use=reference — справка участника). Для целого предложения можно также
+   вызвать translate_draft (черновик машинного перевода с автопроверкой слов) и find_examples(mode="semantic")
+   для поиска близких по смыслу примеров корпуса.
 2. Ингушская фраза → русский: сначала ищи параллель в parallel / phrasebook контекста — её перевод и есть
-   ответ; нет параллели — переводи смыслом фразы целиком, потом краткий разбор по словам.
+   ответ; нет параллели — используй translate_draft как опору и сверь ключевые слова по словарю.
 3. Отдельные слова — search_dictionary (оба направления); для употребления и готовых сочетаний со словом —
    ещё translation_context (пары корпуса, разговорник, правки носителей); что за форма — analyze_word; все
    формы — get_paradigm (бери форму из таблицы, а не склоняй сам; форму другого класса — из ряда cls).
-4. Свой ингушский текст перед ответом прогони через check_ingush_text: слово с verdict=unverified — замени
-   подтверждённым или прямо скажи, что оно не подтверждено. Лемма там — первое чтение анализатора
+4. Свой ингушский текст (и черновик translate_draft с draft=true) перед ответом сверь по check_ingush_text /
+   word_check: слово с verdict=unverified — замени подтверждённым или прямо скажи, что оно не подтверждено,
+   и не выдавай черновик за проверенный носителем перевод. Лемма там — первое чтение анализатора
    (справка); значения и ссылки для ответа бери из search_dictionary.
-5. found=false — так и скажи, предложи близкие из suggestions.
+5. found=false — так и скажи; suggestions — только «возможно, имелось в виду», сверь их, прежде чем дать.
+6. Много слов сразу (список, слова текста) — search_terms; число словами — number_to_words (не составляй
+   числительное сам). 4, 14, 80 и составные с ними меняются по классу: ответ даёт их в классе д (class_variable),
+   форму другого класса не строй — бери из словаря или корпуса или скажи, что не уверен.
+7. Черновик translate_draft — ВСЕГДА с пометкой «черновик машинного перевода, не проверен носителем», даже
+   если все слова подтверждены; никогда не выдавай его за факт словаря.
 
 В ОТВЕТЕ
 - Каждое ингушское слово и форму давай со ссылкой на его страницу paydadosh.ru (поле url).
@@ -140,7 +194,8 @@ ASSISTANT_RULES = """\
 - Человек говорит, что форма или перевод неверны, — дай ему report_url этого слова:
   «сообщить об ошибке на paydadosh.ru» (форма на карточке слова, сообщение читает редакция);
   у слова без карточки — форма отзыва https://paydadosh.ru/#feedback-form.
-  Сам никуда ничего не отправляй и не обещай, что ошибку исправят: инструменты PaydaDosh только читают.
+  report_error — только если человек сам просит отправить сообщение: его словами, без имён, почты и
+  телефонов. По своей инициативе ничего не отправляй и не обещай, что ошибку исправят.
 
 ЛОВУШКИ
 - Класс глагола = класс абсолютива. Переходный глагол с эргативом (аз, Ӏа, цо) — класс по ОБЪЕКТУ
@@ -161,6 +216,9 @@ ASSISTANT_RULES = """\
 """
 
 _READ_ONLY = dict(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+# report_error пишет (сообщение в очередь редакции): не только чтение, не разрушает, повтор — новое сообщение
+_WRITE = dict(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
+WRITE_TOOLS = {"report_error"}
 
 
 # ── палочка и вид ответа ───────────────────────────────────────────────────────────────────────
@@ -297,7 +355,8 @@ class UpstreamError(Exception):
 class SiteAPI:
     def __init__(self, base: str = SITE_API, timeout: float = API_TIMEOUT,
                  transport: httpx.AsyncBaseTransport | None = None, feed_key: str | None = None,
-                 concurrency: int = SITE_CONCURRENCY) -> None:
+                 concurrency: int = SITE_CONCURRENCY, mt_concurrency: int = MT_CONCURRENCY,
+                 batch_concurrency: int = BATCH_CONCURRENCY) -> None:
         headers = {"User-Agent": f"paydadosh-mcp/{VERSION}", "Accept": "application/json"}
         key = _env("MCP_FEED_KEY") if feed_key is None else feed_key
         if key:
@@ -305,12 +364,17 @@ class SiteAPI:
         self._client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(timeout), headers=headers,
                                          transport=transport, trust_env=False)
         self._sem = asyncio.Semaphore(max(1, concurrency))
+        self._mt_sem = asyncio.Semaphore(max(1, mt_concurrency))
+        self._batch_sem = asyncio.Semaphore(max(1, batch_concurrency))
 
-    async def _call(self, method: str, path: str, timeout: float | None = None, **kw: Any) -> dict[str, Any]:
+    async def _call(self, method: str, path: str, timeout: float | None = None, lane: str = "site",
+                    **kw: Any) -> dict[str, Any]:
         # Очередь к сайту: у воркера сайта одно соединение с базой, параллельные тяжёлые вызовы встают
-        # друг за другом (замер: 4 одновременно — p50 3,4 с против 0,2–0,9 с по одному).
+        # друг за другом (замер: 4 одновременно — p50 3,4 с против 0,2–0,9 с по одному). Перевод (lane="mt") и
+        # пакетный поиск (lane="batch") — свои очереди: долгие вызовы не занимают места словаря.
+        sem = {"mt": self._mt_sem, "batch": self._batch_sem}.get(lane, self._sem)
         try:
-            await asyncio.wait_for(self._sem.acquire(), timeout=QUEUE_TIMEOUT)
+            await asyncio.wait_for(sem.acquire(), timeout=QUEUE_TIMEOUT)
         except asyncio.TimeoutError as exc:
             raise UpstreamError("busy") from exc
         try:
@@ -321,7 +385,7 @@ class SiteAPI:
         except httpx.HTTPError as exc:
             raise UpstreamError(type(exc).__name__) from exc
         finally:
-            self._sem.release()
+            sem.release()
         if resp.status_code != 200:
             raise UpstreamError(f"HTTP {resp.status_code}")
         try:
@@ -332,11 +396,13 @@ class SiteAPI:
             raise UpstreamError("bad JSON")
         return data
 
-    async def get(self, path: str, params: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
-        return await self._call("GET", path, timeout=timeout, params=params)
+    async def get(self, path: str, params: dict[str, Any], timeout: float | None = None,
+                  lane: str = "site") -> dict[str, Any]:
+        return await self._call("GET", path, timeout=timeout, lane=lane, params=params)
 
-    async def post(self, path: str, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
-        return await self._call("POST", path, timeout=timeout, json=payload)
+    async def post(self, path: str, payload: dict[str, Any], timeout: float | None = None,
+                   lane: str = "site") -> dict[str, Any]:
+        return await self._call("POST", path, timeout=timeout, lane=lane, json=payload)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -368,32 +434,79 @@ class TTLCache:
 
 
 class RateLimiter:
-    """Скользящее окно в минуту на ключ (хэш IP). Нужен тяжёлому translation_context — сверх лимита nginx."""
+    """Скользящее окно на ключ (хэш IP), по умолчанию минута. Нужен тяжёлым инструментам — сверх лимита nginx.
+    `cost` — сколько единиц тратит вызов (search_terms: ⌈N/5⌉)."""
 
     MAX_KEYS = 10_000
 
-    def __init__(self, per_minute: int, shared_per_minute: int | None = None) -> None:
+    def __init__(self, per_minute: int, shared_per_minute: int | None = None, window: float = 60.0,
+                 unit: str = "minute") -> None:
         self.per_minute = per_minute
         self.shared_per_minute = shared_per_minute or per_minute
+        self.window = window
+        self.unit = unit
         self._hits: OrderedDict[str, deque] = OrderedDict()
 
-    def allow(self, key: str, shared: bool = False) -> bool:
+    def allow(self, key: str, shared: bool = False, cost: int = 1) -> bool:
         """`shared` — адрес из общей сети облачного клиента (за ним много людей): лимит выше."""
         now = time.monotonic()
         key = key or "anon"
+        cost = max(1, int(cost))
         dq = self._hits.get(key)
         if dq is None:
             dq = self._hits[key] = deque()
         self._hits.move_to_end(key)
-        while dq and dq[0] <= now - 60:
+        while dq and dq[0] <= now - self.window:
             dq.popleft()
         limit = self.shared_per_minute if shared else self.per_minute
-        if len(dq) >= limit:
+        if len(dq) + cost > limit:
             return False
-        dq.append(now)
+        dq.extend([now] * cost)
         while len(self._hits) > self.MAX_KEYS:   # ограниченная память: выбрасываем самый давний ключ
             self._hits.popitem(last=False)
         return True
+
+
+class GlobalBudget:
+    """Общий потолок на ВЕСЬ сервер: не больше `per_minute` за скользящую минуту и `per_day` за сутки UTC.
+    Счёт в памяти процесса (служба одна; перезапуск обнуляет сутки — редкость, и это только потолок сверху)."""
+
+    def __init__(self, per_minute: int, per_day: int) -> None:
+        self.per_minute = per_minute
+        self.per_day = per_day
+        self._minute: deque = deque()
+        self._day = ""
+        self._day_count = 0
+
+    def _today(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def take(self) -> str:
+        """"" — можно (и вызов засчитан); "minute" / "day" — какой потолок исчерпан."""
+        now = time.monotonic()
+        day = self._today()
+        if day != self._day:
+            self._day, self._day_count = day, 0
+        while self._minute and self._minute[0] <= now - 60:
+            self._minute.popleft()
+        if self._day_count >= self.per_day:
+            return "day"
+        if len(self._minute) >= self.per_minute:
+            return "minute"
+        self._minute.append(now)
+        self._day_count += 1
+        return ""
+
+    def refund(self) -> None:
+        """Вернуть засчитанный вызов (сообщение не ушло: дубль, отказ сайта, сбой)."""
+        if self._minute:
+            self._minute.pop()
+        self._day_count = max(0, self._day_count - 1)
+
+    def left_today(self) -> int:
+        if self._today() != self._day:
+            return self.per_day
+        return max(0, self.per_day - self._day_count)
 
 
 # ── журнал вызовов ─────────────────────────────────────────────────────────────────────────────
@@ -527,6 +640,14 @@ class State:
         self.cache = TTLCache()
         self.clients = Clients()
         self.context_limiter = RateLimiter(CONTEXT_PER_MINUTE, SHARED_CONTEXT_PER_MINUTE)
+        self.semantic_limiter = RateLimiter(SEMANTIC_PER_MINUTE, SHARED_SEMANTIC_PER_MINUTE)
+        self.semantic_budget = GlobalBudget(SEMANTIC_GLOBAL_PER_MINUTE, SEMANTIC_GLOBAL_PER_DAY)
+        self.mt_limiter = RateLimiter(MT_PER_MINUTE, SHARED_MT_PER_MINUTE)
+        self.mt_budget = GlobalBudget(MT_GLOBAL_PER_MINUTE, MT_GLOBAL_PER_DAY)
+        self.report_limiter = RateLimiter(REPORTS_PER_HOUR, SHARED_REPORTS_PER_HOUR, window=3600.0, unit="hour")
+        self.report_budget = GlobalBudget(REPORTS_PER_DAY, REPORTS_PER_DAY)
+        self.batch_limiter = RateLimiter(BATCH_UNITS_PER_MINUTE, SHARED_BATCH_UNITS_PER_MINUTE)
+        self.traps: tuple[float, str] | None = None     # (срок, текст) — «частые ошибки моделей», если включены
 
 
 STATE: State | None = None
@@ -580,25 +701,33 @@ def wants_links(ctx: Context | None) -> bool:
 async def run_tool(tool: str, ctx: Context | None, args: dict[str, Any], log_q: str,
                    compute: Callable[[], Awaitable[dict[str, Any]]],
                    log_extra: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-                   limiter: RateLimiter | None = None) -> CallToolResult:
-    """Общая обвязка инструмента: кэш 10 минут, лимит, размер ответа, палочка, журнал, ошибки сайта."""
+                   limiter: RateLimiter | None = None,
+                   should_cache: Callable[[dict[str, Any]], bool] | None = None,
+                   cost: int = 1, use_cache: bool = True) -> CallToolResult:
+    """Общая обвязка инструмента: кэш 10 минут, лимит, размер ответа, палочка, журнал, ошибки сайта.
+    `cost` — единиц лимита на вызов; `use_cache=False` — пишущий инструмент (повтор = новое действие)."""
     st = state()
     started = time.perf_counter()
     ip, ua = _request_meta(ctx)
     iph = st.journal.ip_hash(ip)
     client = st.clients.lookup((iph, ua)) or ua_family(ua)
     key = tool + "|" + json.dumps(args, sort_keys=True, ensure_ascii=False)
-    cached = st.cache.get(key)
+    cached = st.cache.get(key) if use_cache else None
     result: dict[str, Any] | None = cached
     error = ""
     try:
         if result is None:
-            if limiter is not None and not limiter.allow(iph, shared=is_shared_egress(ip)):
+            shared = is_shared_egress(ip)
+            if limiter is not None and not limiter.allow(iph, shared=shared, cost=cost):
                 error = "rate_limited"
-                raise ToolError(f"Rate limit: {limiter.per_minute} {tool} calls per minute. Wait a minute; "
+                limit = limiter.shared_per_minute if shared else limiter.per_minute
+                raise ToolError(f"Rate limit: {limit} {tool} "
+                                f"{'units (1 unit = 5 terms)' if tool == 'search_terms' else 'calls'} per "
+                                f"{limiter.unit}. Wait a {limiter.unit}; "
                                 "search_dictionary and get_paradigm are not limited this way.")
             result = fit(display(await compute()))
-            st.cache.set(key, result)
+            if use_cache and (should_cache is None or should_cache(result)):
+                st.cache.set(key, result)
         return as_result(result, links=wants_links(ctx))
     except UpstreamError as exc:
         error = str(exc)
@@ -631,7 +760,22 @@ async def run_tool(tool: str, ctx: Context | None, args: dict[str, Any], log_q: 
 # ── ответы инструментов (чистые функции — их и проверяют тесты) ─────────────────────────────────
 LEVEL = {"ok": "high", "mid": "medium", "hyp": "hypothesis"}
 PROV_RAZBOR = {"ok": "verified", "pub": "published", "draft": "draft"}
-PROV_CORPUS = {"verified": "verified", "published": "published", "draft": "draft", "": "none"}
+PROV_CORPUS = {"verified": "verified", "published": "published", "ai_approved": "ai_approved", "draft": "draft",
+               "machine_draft": "draft", "": "none"}
+DID_YOU_MEAN = "возможно, имелось в виду"
+# Что значит `translation` у предложения корпуса (find_examples): машинный перевод — всегда «черновик».
+TRANSLATION_LEGEND = {
+    "verified": "перевод проверен модератором или носителем",
+    "published": "перевод из печатного издания",
+    "ai_approved": "машинный перевод, принятый редакцией при просмотре; носителем не проверен",
+    "draft": "машинный перевод — черновик, не проверен носителем; не выдавай его за перевод",
+    "none": "перевода нет",
+}
+DRAFT_TRANSLATION_NOTE = ("translation=draft — машинный перевод корпуса, черновик, не проверен носителем: смысл "
+                          "предложения передавай с этой оговоркой; ингушский текст — подлинный.")
+MT_DRAFT_NOTE = ("Черновик машинного перевода PaydaDosh, не проверен носителем. Не выдавай его за перевод носителя "
+                 "или словаря: сверь слова по словарю (search_dictionary), классы глаголов и слова с "
+                 "verdict=unverified; правка редакции у предложения — verified=true.")
 TIER_LEGEND = {
     "verified": "проверено модератором или носителем",
     "dictionary": "напечатано в словаре",
@@ -645,6 +789,19 @@ WORD_VERDICTS = {   # та же проверка, что у помощника �
     "unverified": "нигде не подтверждено — вероятно ошибка или выдуманная форма",
 }
 POS_HINT = {"noun": "NOUN", "verb": "VERB", "adj": "ADJ"}
+
+
+_SUGG_TAIL = re.compile(r"\s+[—–]\s.*$|\s*[(\[{].*$", re.S)
+
+
+def suggestion_words(raw: Any) -> list[str]:
+    """Подсказки — голые слова: «хьатара (бос) — смуглый» → «хьатара» (старый сайт отдавал строку карточки)."""
+    out: list[str] = []
+    for s in raw or []:
+        w = _SUGG_TAIL.sub("", str(s or "")).strip() if s else ""
+        if w and w not in out:
+            out.append(w)
+    return out[:5]
 
 
 def _url_of(item: dict[str, Any], fallback: str) -> str:
@@ -679,13 +836,16 @@ def shape_search(raw: dict[str, Any], query: str) -> dict[str, Any]:
         out["wordform_of"] = forms
     if ozdoev:
         out["ozdoev"] = ozdoev
-    sugg = [s for s in raw.get("suggestions") or [] if s][:5]
+    sugg = suggestion_words(raw.get("suggestions"))
     notes = []
     if raw.get("ru_lemma") and entries:
         notes.append(f"Искали по начальной форме «{raw['ru_lemma']}».")
     if not out["found"]:
-        notes.append("В словаре PaydaDosh этого нет." + (f" Похожие написания: {', '.join(sugg)}." if sugg else ""))
+        notes.append("В словаре PaydaDosh этого нет." + (f" {DID_YOU_MEAN.capitalize()}: {', '.join(sugg)} — "
+                                                        "проверь, прежде чем подставлять." if sugg else ""))
         out["suggestions"] = [{"word": s, "url": page_url("/", s)} for s in sugg]
+        if sugg:
+            out["suggestions_note"] = DID_YOU_MEAN
     elif not entries and forms:
         notes.append("Это словоформа, а не заголовок: лемма в wordform_of; полный разбор — analyze_word.")
     if notes:
@@ -755,12 +915,14 @@ def shape_analysis(raw: dict[str, Any], word: str) -> dict[str, Any]:
     if rows:
         out["examples"] = rows
         out["examples_total"] = int(ex.get("total") or len(rows))
+        out["translation_legend"] = TRANSLATION_LEGEND
     if not out["found"]:
-        sugg = [s for s in raw.get("suggestions") or [] if s][:5]
+        sugg = suggestion_words(raw.get("suggestions"))
         note = "Разобрать не удалось: такой формы нет ни в словаре, ни у анализатора."
         if sugg:
-            note += f" Похожие написания: {', '.join(sugg)}."
+            note += f" {DID_YOU_MEAN.capitalize()}: {', '.join(sugg)} — проверь, прежде чем подставлять."
             out["suggestions"] = [{"word": s, "url": page_url("/razbor", s)} for s in sugg]
+            out["suggestions_note"] = DID_YOU_MEAN
         hyp = raw.get("hypothesis")
         if hyp and hyp.get("lemma"):
             out["unverified_guess"] = {"lemma": hyp["lemma"], "pos": hyp.get("pos") or "",
@@ -932,7 +1094,58 @@ def shape_examples(raw: dict[str, Any], word: str) -> dict[str, Any]:
     elif total > len(rows):
         out["note"] = (f"Показаны первые {len(rows)}; всего совпадений в корпусе {total} (вместе с совпадениями "
                        "внутри других слов); остальные — на сайте по ссылке url.")
+    if rows:
+        out["translation_legend"] = TRANSLATION_LEGEND
+    if any(r["translation"] == "draft" for r in rows):
+        out["note"] = (out.get("note", "") + " " + DRAFT_TRANSLATION_NOTE).strip()
     out["url"] = page_url("/corpus", word)
+    return out
+
+
+def shape_semantic_examples(raw: dict[str, Any], query: str) -> dict[str, Any]:
+    corpus_url = (page_url("/corpus", query) + "&smysl=1") if query else (PUBLIC_SITE + "/corpus")
+    rows = []
+    for it in (raw.get("items") or [])[:EXAMPLES_MAX]:
+        ing = _clip(it.get("ing"), EXAMPLE_CHARS)
+        if not ing:
+            continue
+        path = own_path(it.get("path"))
+        row: dict[str, Any] = {
+            "ing": ing,
+            "ru": _clip(it.get("ru"), EXAMPLE_CHARS),
+            "translation": PROV_CORPUS.get(it.get("prov") or "", "none"),
+            "source": it.get("source") or "",
+            "work": _clip(it.get("work"), 160),
+            "url": site_url(path) if path else corpus_url,
+        }
+        if it.get("page"):
+            row["page"] = str(it["page"])
+        if isinstance(it.get("publication"), dict) and not path:
+            pub = {k: it["publication"][k] for k in ("title", "date", "url") if it["publication"].get(k)}
+            if pub:
+                row["publication"] = pub
+        rows.append(row)
+    total = int(raw.get("total") or 0)
+    out: dict[str, Any] = {"found": bool(rows), "word": query, "mode": "semantic",
+                           "examples": rows, "total": max(total, len(rows))}
+    if rows:
+        out["translation_legend"] = TRANSLATION_LEGEND
+    if raw.get("limited"):
+        out["available"] = False
+        out["limited"] = str(raw["limited"]) if isinstance(raw["limited"], str) else "minute"
+        out["note"] = ("Общий лимит поиска по смыслу для всех клиентов MCP сейчас исчерпан — попробуй "
+                       "mode='lexical' или повтори позже.")
+    elif not raw.get("available"):
+        out["available"] = False
+        out["note"] = "Поиск по смыслу сейчас недоступен — попробуй mode='lexical'."
+    elif not rows:
+        out["note"] = "По смыслу в корпусе близких предложений не нашлось."
+    elif total > len(rows):
+        out["note"] = (f"Показаны первые {len(rows)} по близости смысла; всего кандидатов {total}; "
+                       "остальные — на сайте по ссылке url.")
+    if any(r["translation"] == "draft" for r in rows):
+        out["note"] = (out.get("note", "") + " " + DRAFT_TRANSLATION_NOTE).strip()
+    out["url"] = corpus_url
     return out
 
 
@@ -950,11 +1163,18 @@ def shape_context(raw: dict[str, Any], question: str) -> dict[str, Any]:
     corpus_url = page_url("/corpus", question)
     out: dict[str, Any] = {"found": bool(raw.get("found")), "question": question,
                            "direction": raw.get("direction") or ""}
+    if raw.get("ready_answers"):
+        # готовый ответ на ЭТОТ запрос из выверенных данных (правка, разговорник, Оздоев) — бери дословно;
+        # use=reference (ответ «Хаттараш») — справка участника, сверяй со словарём
+        out["ready_answers"] = with_url(raw["ready_answers"], lambda it: page_url("/", question))
     if raw.get("corrections"):
         out["native_corrections"] = list(raw["corrections"])
     if raw.get("ozdoev"):
         out["ozdoev"] = list(raw["ozdoev"])     # русско-ингушский словарь Оздоева (ОЗД80), как у помощника
     out["dictionary"] = with_url(raw.get("dictionary") or [], lambda it: page_url("/", it.get("term") or ""))
+    for card in out["dictionary"]:              # примеры корпуса к статье — ссылкой на её карточку
+        if card.get("examples"):
+            card["examples"] = [{**x, "url": card["url"]} for x in card["examples"] if isinstance(x, dict)]
     out["parallel"] = with_url(raw.get("parallel") or [], lambda it: corpus_url)
     out["phrasebook"] = with_url(raw.get("phrasebook") or [], lambda it: PUBLIC_SITE + "/phrasebook")
     if raw.get("qa"):
@@ -973,15 +1193,25 @@ def shape_context(raw: dict[str, Any], question: str) -> dict[str, Any]:
         out["proverbs"] = list(raw["proverbs"])
     if raw.get("numbers"):
         out["numbers"] = raw["numbers"]
-    out["order"] = ("native_corrections → phrasebook → parallel → ozdoev / dictionary → grammar_notes: "
-                    "правка носителя и готовая фраза главнее собственной сборки")
+    if raw.get("paradigms"):
+        out["paradigms"] = raw["paradigms"]     # формы слов запроса из таблиц карточек — бери отсюда, не склоняй
+    if raw.get("article_examples"):
+        out["article_examples"] = list(raw["article_examples"])
+    if raw.get("stories"):
+        out["stories"] = with_url(raw["stories"], lambda it: PUBLIC_SITE + "/stories")
+    if raw.get("untranslated_corpus"):
+        out["untranslated_corpus"] = [{**u, "url": page_url("/corpus", u.get("ing") or "")}
+                                      for u in raw["untranslated_corpus"]]
+    out["order"] = ("ready_answers → native_corrections → phrasebook → parallel → ozdoev / dictionary → "
+                    "paradigms → grammar_notes: готовый ответ, правка носителя и готовая фраза главнее собственной "
+                    "сборки; stories — образец строя фразы, не готовый перевод")
     if not out["found"]:
         out["note"] = "Для этого вопроса в PaydaDosh ничего не нашлось — не сочиняй перевод, скажи об этом."
     out["url"] = page_url("/", question)
     return out
 
 
-def shape_check_text(raw: dict[str, Any], truncated: bool) -> dict[str, Any]:
+def _shape_checked_words(raw: dict[str, Any]) -> list[dict[str, Any]]:
     words = []
     for w in raw.get("words") or []:
         w = dict(w)
@@ -994,6 +1224,11 @@ def shape_check_text(raw: dict[str, Any], truncated: bool) -> dict[str, Any]:
         if w.get("suggestions"):
             w["suggestions"] = [{"word": s, "url": page_url("/razbor", s)} for s in w["suggestions"]]
         words.append(w)
+    return words
+
+
+def shape_check_text(raw: dict[str, Any], truncated: bool) -> dict[str, Any]:
+    words = _shape_checked_words(raw)
     checked = int(raw.get("checked_words") or 0)
     unknown = list(raw.get("unknown_words") or [])
     out: dict[str, Any] = {"found": checked > 0, "checked_words": checked, "all_confirmed": checked > 0 and not unknown,
@@ -1016,6 +1251,135 @@ def shape_check_text(raw: dict[str, Any], truncated: bool) -> dict[str, Any]:
     if notes:
         out["note"] = " ".join(notes)
     out["url"] = PUBLIC_SITE + "/spellcheck"
+    return out
+
+
+def shape_translate_draft(raw: dict[str, Any], truncated: bool) -> dict[str, Any]:
+    """Черновик машинного перевода: ВСЕГДА draft=true и пометка draft_note (не перевод носителя и не словарь)."""
+    segments = []
+    for seg in raw.get("segments") or []:
+        if not isinstance(seg, dict):
+            continue
+        item: dict[str, Any] = {
+            "src": str(seg.get("src") or ""),
+            "tgt": str(seg.get("tgt") or ""),
+            "verified": bool(seg.get("verified")),
+        }
+        if seg.get("alts"):
+            item["alts"] = [str(a) for a in seg["alts"] if a]
+        segments.append(item)
+    translation = str(raw.get("translation") or "").strip()
+    out: dict[str, Any] = {
+        "found": bool(raw.get("found") and translation),
+        "draft": True,
+        "draft_note": MT_DRAFT_NOTE,
+        "direction": str(raw.get("direction") or ""),
+        "translation": translation,
+        "segments": segments,
+        "all_verified_by_moderator": bool(raw.get("all_verified_by_moderator")),
+    }
+    wc = raw.get("word_check")
+    unknown: list[str] = []
+    if isinstance(wc, dict) and int(wc.get("checked_words") or 0) > 0:
+        unknown = list(wc.get("unknown_words") or [])
+        out["word_check"] = {
+            "checked_words": int(wc.get("checked_words") or 0),
+            "all_confirmed": not unknown,
+            "unknown_words": unknown,
+            "counts": wc.get("counts") or {},
+            "words": _shape_checked_words(wc),
+            "verdicts": WORD_VERDICTS,
+        }
+    notes = []
+    if not out["found"]:
+        notes.append("Перевести не удалось — проверь текст или используй translation_context.")
+    if unknown:
+        notes.append("В черновике есть неподтверждённые слова (word_check.unknown_words) — замени их "
+                     "подтверждёнными формами или предупреди пользователя.")
+    if out["all_verified_by_moderator"]:
+        notes.append("Все предложения совпали с правками редакции переводчика (verified=true) — это правка "
+                     "машинного перевода, а не ответ носителя на вопрос.")
+    if truncated or raw.get("truncated"):
+        notes.append(f"Переведены первые {MT_TEXT_MAX} знаков (не больше 5 предложений).")
+    if notes:
+        out["note"] = " ".join(notes)
+    out["url"] = PUBLIC_SITE + "/perevodchik"
+    return out
+
+
+def mt_limited(kind: str) -> dict[str, Any]:
+    """Ответ без перевода, когда общий потолок переводов исчерпан (не ошибка: модель должна сказать человеку)."""
+    when = "на сегодня (сутки UTC)" if kind == "day" else "на эту минуту"
+    return {"found": False, "draft": True, "draft_note": MT_DRAFT_NOTE, "limited": kind,
+            "translation": "", "segments": [],
+            "note": (f"Общий лимит черновых переводов PaydaDosh для всех клиентов MCP {when} исчерпан — "
+                     "перевода нет. Не переводи сам «от имени PaydaDosh»: собери ответ из translation_context и "
+                     "search_dictionary или предложи переводчик на сайте (url)."),
+            "url": PUBLIC_SITE + "/perevodchik"}
+
+
+def shape_search_terms(raw: dict[str, Any], terms: list[str]) -> dict[str, Any]:
+    items = []
+    for it in raw.get("items") or []:
+        q = str(it.get("q") or "")
+        row: dict[str, Any] = {"term": q, "found": bool(it.get("found"))}
+        e = it.get("entry") if isinstance(it.get("entry"), dict) else None
+        if e:
+            row.update({"headword": e.get("term") or "", "pos": e.get("pos") or "",
+                        "translation": e.get("definition") or "", "sources": list(e.get("sources") or []),
+                        "url": site_url(e.get("path") or f"/word/{e.get('id')}")})
+            if e.get("noun_class"):
+                row["noun_class"] = e["noun_class"]
+            with_report(row)
+        elif isinstance(it.get("wordform_of"), dict):
+            f = it["wordform_of"]
+            row.update({"headword": f.get("lemma") or "", "pos": f.get("pos") or "",
+                        "note": "словоформа: лемма в headword; толкование — search_dictionary",
+                        "url": _url_of(f, page_url("/razbor", f.get("lemma") or q))})
+            with_report(row)
+        else:
+            row["url"] = page_url("/", q)
+            sugg = suggestion_words(it.get("suggestions"))
+            if it.get("skipped"):
+                row["skipped"] = True
+            if sugg:
+                row["suggestions"] = [{"word": x, "url": page_url("/", x)} for x in sugg]
+                row["suggestions_note"] = DID_YOU_MEAN
+        items.append(row)
+    found = sum(1 for r in items if r["found"])
+    skipped = [r["term"] for r in items if r.get("skipped")]
+    out: dict[str, Any] = {"found": found > 0, "count": len(items), "found_count": found, "items": items}
+    notes = []
+    if found + len(skipped) < len(items):
+        notes.append("found=false — такого слова в словаре PaydaDosh нет: не выдумывай перевод; suggestions — "
+                     f"{DID_YOU_MEAN}. Полную статью слова — search_dictionary.")
+    if skipped:
+        out["skipped_count"] = len(skipped)
+        notes.append(f"{len(skipped)} слов не проверены (skipped=true): вышло время пакета. Это не «нет в словаре» — "
+                     "повтори их отдельным вызовом позже.")
+    if notes:
+        out["note"] = " ".join(notes)
+    out["url"] = PUBLIC_SITE
+    return out
+
+
+def shape_numbers(raw: dict[str, Any]) -> dict[str, Any]:
+    n = str(raw.get("n") or "")
+    if not raw.get("found"):
+        note = {"too_large": "Число больше 10^21 − 1 — страница /numbers считает до квинтиллиона.",
+                "digits_only": "Нужно целое неотрицательное число цифрами."}.get(raw.get("error") or "", "Нет ответа.")
+        return {"found": False, "number": n, "note": note, "url": PUBLIC_SITE + "/numbers"}
+    out: dict[str, Any] = {"found": True, "number": n, "cardinal": raw.get("cardinal") or ""}
+    if raw.get("ordinal"):
+        out["ordinal"] = raw["ordinal"]
+    for k in ("collective", "class", "class_forms", "class_variable", "class_note"):
+        if raw.get(k):
+            out[k] = raw[k]
+    if out.get("class_variable") and out.get("class") and out["class"] != "д":
+        out["class_warning"] = (f"Формы класса {out['class']} для {', '.join(out['class_variable'])} здесь нет: "
+                                "дана форма класса д. Не подставляй букву класса сам.")
+    out["source"] = "PaydaDosh /numbers (двадцатеричный счёт; справка — Э. А. Аушева)"
+    out["url"] = PUBLIC_SITE + "/numbers"
     return out
 
 
@@ -1110,20 +1474,39 @@ async def get_paradigm(
 
 async def find_examples(
     ctx: Context,
-    word: Annotated[str, Field(min_length=2, max_length=60, description=(
-        "Ingush word (its forms are found too) or a Russian word to look up in translations, "
-        "e.g. «дог», «бӀаргаш», «сердце»."))],
+    word: Annotated[str, Field(min_length=2, max_length=120, description=(
+        "Ingush or Russian word (mode='lexical', default) or a short phrase/idea (mode='semantic'), "
+        "e.g. «дог», «бӀаргаш», «сердце», «пойти в гости»."))],
+    mode: Annotated[Literal["lexical", "semantic"], Field(description=(
+        "lexical (default) — exact word and its forms in the corpus; "
+        "semantic — meaning-based search across both Ingush and Russian queries."))] = "lexical",
 ) -> ToolOut:
-    w = _word_arg(word)
+    w = normalize_query(word)[:120]
 
     async def compute() -> dict[str, Any]:
         if len(w) < 2:
             return _empty("word", w, PUBLIC_SITE + "/corpus")
+        if mode == "semantic":
+            # общий потолок на весь сервер — до вызова сайта; исчерпан — ответ без примеров (не ошибка, не в кэш)
+            limited = state().semantic_budget.take()
+            if limited:
+                return shape_semantic_examples({"q": w, "available": False, "limited": limited, "items": [],
+                                                "total": 0}, w)
+            try:
+                raw = await state().api.get("/api/mcp-feed/v1/semantic-examples", {"q": w, "limit": EXAMPLES_MAX})
+            except UpstreamError as exc:
+                if str(exc) == "HTTP 404":
+                    return shape_semantic_examples({"q": w, "available": False, "items": [], "total": 0}, w)
+                raise
+            return shape_semantic_examples(raw, w)
         # только первая страница выдачи: ни `page`, ни `source` не передаём (права изданий)
         raw = await state().api.get("/api/app/v1/corpus", {"q": w})
         return shape_examples(raw, w)
 
-    return await run_tool("find_examples", ctx, {"w": w}, w, compute)
+    # по смыслу — вызов кодировщика на стороне сайта: лимит на адрес, как у translation_context
+    return await run_tool("find_examples", ctx, {"w": w, "m": mode}, w, compute,
+                          should_cache=lambda r: r.get("available", True),
+                          limiter=state().semantic_limiter if mode == "semantic" else None)
 
 
 async def translation_context(
@@ -1143,11 +1526,167 @@ async def translation_context(
     return await run_tool("translation_context", ctx, {"q": q}, q, compute, limiter=state().context_limiter)
 
 
+async def translate_draft(
+    ctx: Context,
+    text: Annotated[str, Field(min_length=1, max_length=1000, description=(
+        "Russian or Ingush sentence or short text to translate (first 400 characters, up to 5 sentences). "
+        "E.g. «Мы хотим, чтобы наш язык жил.» or «Дог дика да цун.»"))],
+    direction: Annotated[Literal["auto", "ru2inh", "inh2ru"], Field(description=(
+        "ru2inh (Russian → Ingush), inh2ru (Ingush → Russian), or auto (default). "
+        "Pass ru2inh or inh2ru explicitly when you know the source language."))] = "auto",
+) -> ToolOut:
+    norm = normalize_query(text)
+    t, truncated = norm[:MT_TEXT_MAX], len(norm) > MT_TEXT_MAX
+
+    async def compute() -> dict[str, Any]:
+        if not t:
+            return {**_empty("text", t, PUBLIC_SITE + "/perevodchik"), "draft": True, "draft_note": MT_DRAFT_NOTE}
+        # общий потолок на весь сервер — до вызова сайта: исчерпан → ответ без перевода (не ошибка, не в кэш)
+        limited = state().mt_budget.take()
+        if limited:
+            return mt_limited(limited)
+        raw = await state().api.post("/api/mcp-feed/v1/translate-draft",
+                                     {"text": t, "direction": direction}, timeout=MT_TIMEOUT, lane="mt")
+        return shape_translate_draft(raw, truncated)
+
+    def _log_extra(result: dict[str, Any]) -> dict[str, Any]:
+        wc = result.get("word_check") if isinstance(result.get("word_check"), dict) else {}
+        unknown = [str(w)[:40] for w in dict.fromkeys(wc.get("unknown_words") or []) if w][:30]
+        extra = {"chars": len(t), "direction": result.get("direction") or "", "unknown": unknown}
+        if result.get("limited"):
+            extra["limited"] = result["limited"]
+        return extra
+
+    key = hashlib.sha256(f"{direction}|{t}".encode()).hexdigest()
+    # в журнал — как у остальных: короткий текст (≤ 60 знаков) целиком, длинный — только длина
+    return await run_tool("translate_draft", ctx, {"d": direction, "t": key},
+                          t if len(t) <= LOG_TEXT_SHORT else "", compute,
+                          log_extra=_log_extra, limiter=state().mt_limiter,
+                          should_cache=lambda r: not r.get("limited"))
+
+
+async def search_terms(
+    ctx: Context,
+    terms: Annotated[list[Annotated[str, Field(min_length=1, max_length=100)]], Field(
+        min_length=1, max_length=BATCH_MAX, description=(
+            "Up to 50 Ingush or Russian words, e.g. [«дог», «кӀант», «сердце»]."))],
+    direction: Annotated[Literal["auto", "ing_to_rus", "rus_to_ing"], Field(description=(
+        "auto (default) detects the language of each word; ing_to_rus / rus_to_ing for all of them."))] = "auto",
+) -> ToolOut:
+    words = [w for w in (_word_arg(x) for x in terms) if w][:BATCH_MAX]
+
+    async def compute() -> dict[str, Any]:
+        if not words:
+            return _empty("terms", "", PUBLIC_SITE)
+        raw = await state().api.post("/api/mcp-feed/v1/search-batch", {"terms": words, "direction": direction},
+                                     timeout=BATCH_TIMEOUT, lane="batch")
+        return shape_search_terms(raw, words)
+
+    def _log_extra(result: dict[str, Any]) -> dict[str, Any]:
+        missed = [r.get("term") for r in result.get("items") or [] if not r.get("found") and not r.get("skipped")]
+        return {"terms": len(words), "found_count": result.get("found_count", 0),
+                "unknown": [str(w)[:40] for w in missed if w][:30]}
+
+    # в лимитах — как ⌈N/5⌉ вызовов: 50 слов = 10 единиц
+    return await run_tool("search_terms", ctx, {"t": words, "d": direction}, " | ".join(words), compute,
+                          log_extra=_log_extra, limiter=state().batch_limiter, cost=max(1, -(-len(words) // 5)),
+                          should_cache=lambda r: not r.get("skipped_count"))
+
+
+def _digits(value: Any) -> Any:
+    # целое из JSON (44) — строкой: схема — строка цифр, чтобы клиенты на JS не округляли числа больше 2^53
+    return str(value) if isinstance(value, int) and not isinstance(value, bool) else value
+
+
+async def number_to_words(
+    ctx: Context,
+    number: Annotated[str, Field(pattern=r"^\d{1,21}$", description=(
+        "A whole number written with digits only, from 0 to 10^21 − 1, e.g. \"44\", \"1999\", \"2026\".")),
+        BeforeValidator(_digits)],
+    noun_class: Annotated[Literal["any", "в", "й", "б", "д"], Field(description=(
+        "Grammatical class of the counted noun {в, й, б, д}, or any (default). Picks the class forms of the "
+        "collective / distributive numerals of 4 and 14 from the page's reference table. Words from «диъ» (4), "
+        "«дийтта» (14), «дезткъа» (80) change by class in every numeral; the answer gives them in class д only "
+        "and lists them in class_variable."))] = "any",
+) -> ToolOut:
+    n = number.lstrip("0") or "0"
+    cls = "" if noun_class == "any" else noun_class
+
+    async def compute() -> dict[str, Any]:
+        params: dict[str, Any] = {"n": n}
+        if cls:
+            params["cls"] = cls
+        raw = await state().api.get("/api/mcp-feed/v1/numbers", params)
+        return shape_numbers(raw)
+
+    return await run_tool("number_to_words", ctx, {"n": n, "c": cls}, n, compute)
+
+
+async def report_error(
+    ctx: Context,
+    problem: Annotated[str, Field(min_length=3, max_length=REPORT_TEXT_MAX, description=(
+        "What is wrong, in the user's words (Russian or English), up to 1000 characters."))],
+    word: Annotated[str, Field(max_length=100, description="The Ingush or Russian word concerned.")] = "",
+    card_url: Annotated[str, Field(max_length=300, description=(
+        "The paydadosh.ru word page (`url` from search_dictionary / get_paradigm), if there is one."))] = "",
+    sentence: Annotated[str, Field(max_length=300, description=(
+        "The sentence or form concerned, if the error is in an example or a translation."))] = "",
+    suggestion: Annotated[str, Field(max_length=REPORT_TEXT_MAX, description=(
+        "The correct form or translation, if the user knows it."))] = "",
+) -> ToolOut:
+    ip, ua = _request_meta(ctx)
+    st = state()
+    client = st.clients.lookup((st.journal.ip_hash(ip), ua)) or ua_family(ua)
+    w, sent = _word_arg(word), normalize_query(sentence)[:300]
+
+    async def compute() -> dict[str, Any]:
+        if not (w or card_url.strip() or sent):
+            return {"found": False, "sent": False, "note": "Укажи word, card_url или sentence — к чему сообщение.",
+                    "url": PUBLIC_SITE + "/#feedback-form"}
+        if st.report_budget.take():
+            return {"found": False, "sent": False, "limited": "day",
+                    "note": ("Дневной лимит сообщений через MCP исчерпан. Дай человеку report_url карточки или "
+                             "форму https://paydadosh.ru/#feedback-form — там он отправит сам."),
+                    "url": PUBLIC_SITE + "/#feedback-form"}
+        payload = {"word": w, "card_url": card_url.strip(), "sentence": sent, "problem": problem.strip(),
+                   "suggestion": suggestion.strip(), "client": client}
+        try:
+            raw = await st.api.post("/api/mcp-feed/v1/report", payload)
+        except UpstreamError as exc:
+            # не ушло — потолок сервера не тратим (иначе дубли и отказы одного адреса закрывали канал всем)
+            st.report_budget.refund()
+            if str(exc) == "HTTP 429":
+                return {"found": False, "sent": False, "limited": "day",
+                        "note": "Дневной лимит сообщений через MCP исчерпан — дай человеку форму на сайте.",
+                        "url": PUBLIC_SITE + "/#feedback-form"}
+            if str(exc) == "HTTP 400":
+                return {"found": False, "sent": False,
+                        "note": "Сообщение не принято: card_url — только страница слова paydadosh.ru.",
+                        "url": PUBLIC_SITE + "/#feedback-form"}
+            raise
+        out: dict[str, Any] = {"found": bool(raw.get("ok")), "sent": bool(raw.get("ok")),
+                               "note": ("Сообщение передано редакции PaydaDosh (очередь модераторов). Скажи "
+                                        "человеку, что его прочтут, но не обещай, что исправят, и не называй "
+                                        "сроков. Ответа через MCP не будет."),
+                               "url": PUBLIC_SITE}
+        if raw.get("entry_id"):
+            out["url"] = site_url(f"/word/{int(raw['entry_id'])}")
+        if raw.get("duplicate") or not raw.get("ok"):
+            st.report_budget.refund()
+        if raw.get("duplicate"):
+            out["note"] = "Такое же сообщение уже отправлено недавно — повторно не отправляем."
+        return out
+
+    # в журнал — только слово и длина сообщения: текст жалобы и предложение не пишем
+    return await run_tool("report_error", ctx, {"w": w}, w, compute, limiter=st.report_limiter, use_cache=False,
+                          log_extra=lambda r: {"chars": len(problem) + len(suggestion), "sent": bool(r.get("sent"))})
+
+
 async def check_ingush_text(
     ctx: Context,
     text: Annotated[str, Field(min_length=1, max_length=5000, description=(
         "Ingush text to verify — typically your own draft answer; Russian words in it are recognised and "
-        "skipped. The first 1000 characters are checked. E.g. «Сона хьо веза, хьо са дог да»."))],
+        "skipped. The first 1000 characters are checked. E.g. «Сона веза хьо кхоана»."))],
 ) -> ToolOut:
     t, truncated = _text_arg(text)
 
@@ -1165,7 +1704,7 @@ async def check_ingush_text(
 async def check_spelling(
     ctx: Context,
     text: Annotated[str, Field(min_length=1, max_length=5000, description=(
-        "Ingush text; the first 1000 characters are checked. E.g. «Со гӀалгӀай ва», «Сона хьо веза»."))],
+        "Ingush text; the first 1000 characters are checked. E.g. «Сона веза хьо гӀулакха»."))],
 ) -> ToolOut:
     t, truncated = _text_arg(text)
 
@@ -1207,19 +1746,63 @@ TOOLS: list[tuple[Callable[..., Any], str, str, str]] = [
         "pick the class of the absolutive; nouns carry `noun_class` with singular and plural class. "
         "main_only=true returns only the principal rows.")),
     (find_examples, "find_examples", "Find example sentences in Ingush texts", (
-        "Up to 5 sentences from the PaydaDosh corpus of Ingush texts (books, press, folklore) with the word "
-        "or its forms, with Russian translation where available (translation: verified / published / draft "
-        "/ none) and the source. First page of results only; the full list is on the site (url). Sentences "
-        "are short quotations from copyrighted publications — always cite the source. Examples: «дог», «бӀаргаш».")),
+        "Up to 5 sentences from the PaydaDosh corpus of Ingush texts (books, press, folklore) with Russian "
+        "translation where available and the source. `translation` tells where the Russian comes from "
+        "(translation_legend): verified — checked by a moderator or native speaker; published — the printed "
+        "translation; ai_approved — machine translation accepted by the editors, not checked by a native speaker; "
+        "draft — machine translation, a draft not checked by a native speaker (never present it as a translation); "
+        "none. "
+        "mode='lexical' (default) matches the exact word and its forms (first page only); mode='semantic' "
+        "searches by meaning across both Ingush and Russian queries (shared limit for all MCP clients). Sentences "
+        "are short quotations from "
+        "copyrighted publications — always cite the source. Examples: «дог», «бӀаргаш», «пойти в гости».")),
     (translation_context, "translation_context", "Get the translation context for a question", (
         "Everything PaydaDosh knows that is relevant to translating a phrase or answering a question about "
         "Ingush — the same material the site's own assistant reads before answering: native-speaker "
         "corrections approved by the editors (use them verbatim), ready phrasebook phrases (check the "
-        "occasion), parallel Ingush–Russian sentences from the corpus, dictionary entries, Ozdoev's "
-        "Russian–Ingush dictionary with its phraseology, grammar notes and native speakers' answers from the "
-        "Q&A section «Хаттараш». Call it FIRST for any phrase translation "
-        "(Russian → Ingush or Ingush → Russian), e.g. «Как сказать „я хочу домой“?», «Мел ха яьннай хьа?». "
-        "Heavier than other tools: limited to 20 calls per minute.")),
+        "occasion), parallel Ingush–Russian sentences from the corpus (lexical plus meaning-based when "
+        "lexical hits are sparse), dictionary entries, Ozdoev's Russian–Ingush dictionary with its "
+        "phraseology, paradigms of the words asked about, grammar notes, examples from reference articles, short "
+        "story passages (a model of phrasing, not a ready answer), native speakers' answers from the Q&A section "
+        "«Хаттараш», and ready_answers — a verified ready answer to this very question (use=verbatim — take it "
+        "as is; use=reference — a participant's answer, check it). Meaning-based corpus pairs are added only with "
+        "a verified translation (prov). Call it FIRST for any phrase translation (Russian → Ingush or "
+        "Ingush → Russian), e.g. «Как сказать „я хочу домой“?», «Мел ха яьннай хьа?». Heavier than other "
+        "tools: limited to 20 calls per minute.")),
+    (translate_draft, "translate_draft", "Draft Russian ↔ Ingush machine translation", (
+        "A DRAFT translation between Russian and Ingush by PaydaDosh's neural translator (up to 400 characters "
+        "and 5 sentences). Every answer has draft=true and draft_note: it is machine output, not checked by a "
+        "native speaker — never present it as a dictionary fact or a native speaker's translation. Sentences that "
+        "match an editor's correction of the translator come with verified=true (and alternatives). For Russian → "
+        "Ingush (`ru2inh`) every Ingush word is checked against PaydaDosh (`word_check`, with card links) and "
+        "unverified words are flagged. Call translation_context first for idioms and phrases; use translate_draft "
+        "as a draft aid for whole sentences. Limited: 10 calls per minute per address and a shared daily limit "
+        "for all MCP clients — when it is used up the answer says so and has no translation. Texts up to 60 "
+        "characters are kept in our log; longer ones — only their length, direction and unverified words.")),
+    (search_terms, "search_terms", "Look up many words at once", (
+        "Batch dictionary lookup: up to 50 Ingush or Russian words in one call (a word list, a glossary, the "
+        "words of a text). For each word: found, the best headword, part of speech, a short Russian definition, "
+        "source codes and the word page link; an inflected Ingush form points to its lemma; a miss has "
+        "suggestions («возможно, имелось в виду»); a word marked skipped=true was not checked in time — retry it. "
+        "Counts as one call per 5 words in the rate limit (100 words per minute per address). For the full entry of "
+        "a word use search_dictionary. Our log keeps the first 64 characters of the word list and up to 30 words "
+        "that were not found.")),
+    (number_to_words, "number_to_words", "Write a number in Ingush words", (
+        "A number in Ingush words with the vigesimal count of the paydadosh.ru/numbers page: cardinal and "
+        "ordinal (e.g. 44 → шовзткъе диъ, шовзткъе диълагӀа), up to 10^21 − 1 (pass the number as a string of "
+        "digits); collective numerals and, for 4 and 14, the class forms {в, й, б, д} of collective / "
+        "distributive numerals from the page's reference table. Words from «диъ» (4), «дийтта» (14), "
+        "«дезткъа» (80) and numbers built with them start with a class prefix and agree with the noun: the "
+        "answer gives them in class д only (class_variable, class_note) — forms of other classes are not "
+        "provided, do not make them up. Use it instead of composing numerals yourself.")),
+    (report_error, "report_error", "Report an error to the PaydaDosh editors", (
+        "Send an error report (wrong form, translation, example, class…) to the PaydaDosh editors' moderation "
+        "queue — the same queue as the error form on a word page. Call it ONLY when the user explicitly asks you "
+        "to report the error, with their description; otherwise give them the item's report_url. Give word, "
+        "card_url (the word page) or sentence, the problem and, if known, the correct form. No personal data: "
+        "do not include names, e-mails or phone numbers (they are removed). Limited: 5 reports per hour per "
+        "address, 50 per day for all clients. The editors read every report but do not reply through MCP — "
+        "do not promise a fix.")),
     (check_ingush_text, "check_ingush_text", "Check Ingush text word by word", (
         "Verify an Ingush text — typically your own draft answer before you send it — with exactly the check "
         "the site's own assistant applies to its answers. Every Ingush word gets a verdict: confirmed (found in "
@@ -1229,18 +1812,48 @@ TOOLS: list[tuple[Callable[..., Any], str, str, str]] = [
         "come with the analyzer's reading (lemma, part of speech, note), and with a gloss and card link only "
         "when the card is unambiguous. Quotes attributed to a source that are not in the data are listed in "
         "unverified_quotes. Replace or flag every unverified word instead of presenting it as Ingush. Example: "
-        "«Сона хьо веза, хьо са дог да». Only the unverified words are kept in our log, not the text.")),
+        "«Сона веза хьо кхоана». Only the unverified words are kept in our log, not the text.")),
     (check_spelling, "check_spelling", "Spell-check Ingush text", (
         "Spell-check a person's Ingush text (up to 1000 characters) with the PaydaDosh spelling dictionary. "
         "Returns each problematic word with its position, kind (error; palochka typed with a wrong letter; "
         "rare form; Russian word) and suggestions, class-agreement grammar warnings and, for short phrases, a "
-        "corrected phrase. Example: «Со гӀалгӀай ва». Only the misspelled words are kept in our log, not the text.")),
+        "corrected phrase. Example: «Сона веза хьо гӀулакха». Only the misspelled words are kept in our log, not the "
+        "text.")),
 ]
 
 
-def ingush_assistant(question: str = "") -> str:
+def ingush_assistant(question: str = "", traps: str = "") -> str:
+    """Правила ответа об ингушском языке с опорой на инструменты PaydaDosh (+ «частые ошибки», если включены)."""
+    text = ASSISTANT_RULES
+    if traps:
+        text += f"\n{TRAPS_HEADING.upper()}\n{traps.strip()}\n"
+    return text + (f"\nВОПРОС ПОЛЬЗОВАТЕЛЯ\n{question.strip()}\n" if question and question.strip() else "")
+
+
+TRAPS_HEADING = "Частые ошибки моделей на ингушском"
+TRAPS_TTL = 3600.0
+
+
+async def public_traps() -> str:
+    """«Частые ошибки моделей на ингушском» — с сайта, только при MCP_EXPOSE_TRAPS=1 (решение владельца не
+    принято, по умолчанию выкл.). Кэш на час; сайт недоступен — подсказка без этого раздела."""
+    if not EXPOSE_TRAPS:
+        return ""
+    st = state()
+    if st.traps and st.traps[0] > time.monotonic():
+        return st.traps[1]
+    try:
+        raw = await st.api.get("/api/mcp-feed/v1/traps", {})
+        text = str(raw.get("text") or "") if raw.get("found") else ""
+    except UpstreamError:
+        return st.traps[1] if st.traps else ""
+    st.traps = (time.monotonic() + TRAPS_TTL, text)
+    return text
+
+
+async def ingush_assistant_prompt(question: str = "") -> str:
     """Правила ответа об ингушском языке с опорой на инструменты PaydaDosh."""
-    return ASSISTANT_RULES + (f"\nВОПРОС ПОЛЬЗОВАТЕЛЯ\n{question.strip()}\n" if question and question.strip() else "")
+    return ingush_assistant(question, await public_traps())
 
 
 # ── сервер ─────────────────────────────────────────────────────────────────────────────────────
@@ -1285,10 +1898,11 @@ def create_mcp() -> FastMCP:
     )
     mcp._mcp_server.version = VERSION
     for fn, name, title, description in TOOLS:
+        hints = _WRITE if name in WRITE_TOOLS else _READ_ONLY
         mcp.add_tool(fn, name=name, title=title, description=description,
-                     annotations=ToolAnnotations(title=title, **_READ_ONLY))
+                     annotations=ToolAnnotations(title=title, **hints))
     mcp.add_prompt(Prompt.from_function(
-        ingush_assistant, name="ingush_assistant", title="Ingush assistant / Ингушский помощник",
+        ingush_assistant_prompt, name="ingush_assistant", title="Ingush assistant / Ингушский помощник",
         description=("Rules for answering questions about the Ingush language with the PaydaDosh tools: "
                      "which tool first, never invent forms, cite sources, link every word to paydadosh.ru, "
                      "and the most common grammar traps.")))

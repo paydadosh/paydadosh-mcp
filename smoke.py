@@ -5,6 +5,8 @@
     .venv/bin/python smoke.py https://paydadosh.ru/mcp --burst 90  # лимит nginx: после ~21 запроса — 429
 
 Печатает по строке на вызов (isError, found, мс, байты) и сводку серии. Выход 1, если была ошибка.
+report_error в проверку не входит: он пишет в очередь редакции (проверка — тестами на записанных ответах).
+translate_draft тратит один перевод из общего суточного лимита.
 ⚠ Лимит проверять НЕ с самого сервера: там все запросы приходят с одного адреса вместе с прочими
 проверками. И с одного адреса: облачные клиенты (Claude, ChatGPT) ходят со своих общих адресов.
 """
@@ -21,6 +23,8 @@ import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
+ANY = "*"          # ответ без ошибки (found любое)
+DRAFT = "draft"    # translate_draft: всегда draft=true и пометка; перевод или понятный отказ по лимиту
 CHECKS = [
     ("search_dictionary", {"query": "хлеб"}, "маькх"),
     ("search_dictionary", {"query": "отец"}, "да"),
@@ -32,8 +36,12 @@ CHECKS = [
     ("get_paradigm", {"word": "ала", "part_of_speech": "verb"}, "аьлар"),
     ("find_examples", {"word": "дог"}, "дог"),
     ("translation_context", {"question": "Как ты себя чувствуешь?"}, "хьона"),
-    ("check_ingush_text", {"text": "Сона хьо веза, хьо са дог да. хьозазаза"}, "хьозазаза"),
-    ("check_spelling", {"text": "Со гIалгIай ва, гулакх"}, "гӀулакх"),
+    ("check_ingush_text", {"text": "Сона веза хьо кхоана. хьозазаза"}, "хьозазаза"),
+    ("check_spelling", {"text": "Сона веза хьо гулакх"}, "гӀулакх"),   # «гулакха» — живая форма (гул), не ошибка
+    ("search_terms", {"terms": ["дог", "сердце", "хьозазаза"]}, "дог"),
+    ("number_to_words", {"number": "44"}, "шовзткъе диъ"),
+    ("find_examples", {"word": "как ты себя чувствуешь", "mode": "semantic"}, ANY),   # по смыслу: бывает недоступен
+    ("translate_draft", {"text": "У него доброе сердце.", "direction": "ru2inh"}, DRAFT),
 ]
 REPORT_TOOLS = {"search_dictionary", "analyze_word", "get_paradigm"}   # у найденного — форма ошибки карточки
 SERIES_WORDS = ["дог", "кӀант", "ала", "дегаш", "сердце", "вода", "хий", "нана", "да", "бер",
@@ -53,8 +61,14 @@ async def run(url: str, series: int) -> int:
                 ms = round((time.perf_counter() - t) * 1000)
                 text = res.content[0].text if res.content else ""
                 data = res.structuredContent or {}
-                ok = not res.isError and (expect is None and data.get("found") is False
-                                          or expect is not None and data.get("found") and expect in text)
+                if expect == ANY:
+                    ok = not res.isError
+                elif expect == DRAFT:
+                    ok = (not res.isError and data.get("draft") is True and bool(data.get("draft_note"))
+                          and (bool(data.get("translation")) or bool(data.get("limited"))))
+                else:
+                    ok = not res.isError and (expect is None and data.get("found") is False
+                                              or expect is not None and data.get("found") and expect in text)
                 # строка источника со ссылкой на paydadosh.ru — в каждом ответе
                 kinds = [c.type for c in res.content or []]
                 ok = ok and len(kinds) > 1 and res.content[1].text.startswith("Источник: PaydaDosh — https://")

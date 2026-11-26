@@ -50,7 +50,14 @@ ROUTES = {
 }
 MISS = {"/api/mcp-feed/v1/search": "search_miss", "/api/mcp-feed/v1/razbor": "razbor_miss",
         "/api/app/v1/corpus": "corpus_miss", "/api/mcp-feed/v1/spell": "spell",
-        "/api/mcp-feed/v1/context": "context_home", "/api/mcp-feed/v1/check-text": "check_text"}
+        "/api/mcp-feed/v1/context": "context_home", "/api/mcp-feed/v1/check-text": "check_text",
+        "/api/mcp-feed/v1/semantic-examples": "semantic_examples",
+        "/api/mcp-feed/v1/translate-draft": "translate_draft",
+        "/api/mcp-feed/v1/search-batch": "search_terms", "/api/mcp-feed/v1/numbers": "numbers_44",
+        "/api/mcp-feed/v1/report": "report_ok", "/api/mcp-feed/v1/traps": "traps"}
+ALL_TOOLS = {"search_dictionary", "search_terms", "analyze_word", "get_paradigm", "find_examples",
+             "translation_context", "translate_draft", "number_to_words", "check_ingush_text", "check_spelling",
+             "report_error"}
 
 
 class FakeSite:
@@ -60,6 +67,7 @@ class FakeSite:
         self.calls: list[tuple[str, dict]] = []
         self.timeouts: list[float] = []
         self.fail: str | None = None
+        self.status: dict[str, int] = {}          # путь → код ответа (429, 400…)
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -72,6 +80,8 @@ class FakeSite:
             raise httpx.ReadTimeout("slow", request=request)
         if self.fail == "500":
             return httpx.Response(500, text="boom")
+        if path in self.status:
+            return httpx.Response(self.status[path], json={"ok": False})
         name = ROUTES.get((path, params.get("q"))) or MISS.get(path)
         if name is None:
             return httpx.Response(404)
@@ -366,11 +376,14 @@ def test_prompt_rules():
     assert "translation_context" in text and "check_ingush_text" in text and "paydadosh.ru" in text
     assert text.rstrip().endswith("Как сказать «спасибо»?")
     assert "url" in srv.INSTRUCTIONS and "check_ingush_text" in srv.INSTRUCTIONS
-    # неверная форма → ссылка на форму ошибки, сам помощник ничего не отправляет
+    # неверная форма → ссылка на форму ошибки; report_error — только по прямой просьбе человека
     for rules in (srv.INSTRUCTIONS, text):
         assert "report_url" in rules and "сообщить об ошибке на paydadosh.ru" in rules
-        assert "#feedback-form" in rules
-    assert "Never report anything yourself" in srv.INSTRUCTIONS and "ничего не отправляй" in text
+        assert "#feedback-form" in rules and "report_error" in rules
+    assert "ONLY when the user explicitly asks" in srv.INSTRUCTIONS and "never report on your own" in srv.INSTRUCTIONS
+    assert "ничего не отправляй" in text and "только если человек сам просит" in text
+    # черновик перевода — всегда с пометкой
+    assert "ALWAYS a draft" in srv.INSTRUCTIONS and "не проверен носителем" in text
 
 
 # ── протокол целиком ───────────────────────────────────────────────────────────────────────────
@@ -381,12 +394,12 @@ def test_initialize_list_and_prompt(client, site, tmp_path):
     assert res["serverInfo"]["name"] == "paydadosh"
     assert "found=false" in res["instructions"]
     tools = rpc(client, "tools/list", {}, 2).json()["result"]["tools"]
-    assert {t["name"] for t in tools} == {"search_dictionary", "analyze_word", "get_paradigm", "find_examples",
-                                          "translation_context", "check_ingush_text", "check_spelling"}
+    assert {t["name"] for t in tools} == ALL_TOOLS
     for t in tools:
         a = t["annotations"]
-        assert a["title"] and a["readOnlyHint"] is True and a["destructiveHint"] is False
-        assert a["openWorldHint"] is False
+        assert a["title"] and a["destructiveHint"] is False and a["openWorldHint"] is False
+        # пишет один report_error (сообщение в очередь редакции) — у него readOnly=false
+        assert a["readOnlyHint"] is (t["name"] != "report_error"), t["name"]
     prompts = rpc(client, "prompts/list", {}, 3).json()["result"]["prompts"]
     assert prompts[0]["name"] == "ingush_assistant" and "Ингушский помощник" in prompts[0]["title"]
     got = rpc(client, "prompts/get", {"name": "ingush_assistant", "arguments": {"question": "Как будет хлеб?"}}, 4)
@@ -418,17 +431,45 @@ def test_every_tool_end_to_end(client, site, tmp_path):
     res = call(client, "translation_context", {"question": "Как ты себя чувствуешь?"})
     assert res["structuredContent"]["native_corrections"]
     assert site.timeouts[-1] == srv.CONTEXT_TIMEOUT                      # у контекста свой таймаут
-    res = call(client, "check_ingush_text", {"text": "Сона хьо веза, хьо са дог да. Со тахан цӀагӀа хургвац, хьозазаза."})
+    res = call(client, "translate_draft", {"text": "У него доброе сердце.", "direction": "ru2inh"})
+    assert res["isError"] is False and res["structuredContent"]["found"] is True
+    assert res["structuredContent"]["draft"] is True and "не проверен носителем" in res["structuredContent"]["draft_note"]
+    assert site.timeouts[-1] == srv.MT_TIMEOUT
+    assert res["structuredContent"]["word_check"]["unknown_words"] == ["хьозазаза"]
+    assert _urls_everywhere(res["structuredContent"]) == []
+    res = call(client, "search_terms", {"terms": ["дог", "дегаш", "хьозазаза"]})
+    assert res["structuredContent"]["found_count"] == 2
+    assert site.calls[-1] == ("/api/mcp-feed/v1/search-batch", {"terms": ["дог", "дегаш", "хьозазаза"],
+                                                                "direction": "auto"})
+    res = call(client, "number_to_words", {"number": "44"})
+    assert res["structuredContent"]["cardinal"] == "шовзткъе диъ"
+    assert site.calls[-1] == ("/api/mcp-feed/v1/numbers", {"n": "44"})
+    res = call(client, "check_ingush_text", {"text": "Сона веза хьо кхоана. Сона веза хьо гӀулакха, хьозазаза."})
     assert res["structuredContent"]["unknown_words"] == ["хьозазаза"]
-    res = call(client, "check_spelling", {"text": "Со гӀалгӀай ва гулакх"})
+    res = call(client, "check_spelling", {"text": "Сона веза хьо гулакх"})
     assert res["structuredContent"]["found"] is True
+
+    res = call(client, "report_error", {"word": "дог", "problem": "в примере неверный перевод",
+                                        "card_url": "https://paydadosh.ru/word/104869-дог"})
+    assert res["structuredContent"]["sent"] is True
+    path, payload = site.calls[-1]
+    assert path == "/api/mcp-feed/v1/report" and payload["client"] == "pytest-client"
+    assert payload["word"] == "дог" and payload["problem"] == "в примере неверный перевод"
 
     rows = [r for r in journal(tmp_path) if r["tool"] != "initialize"]
     assert [r["tool"] for r in rows] == ["search_dictionary", "analyze_word", "get_paradigm", "find_examples",
-                                         "translation_context", "check_ingush_text", "check_spelling"]
+                                         "translation_context", "translate_draft", "search_terms",
+                                         "number_to_words", "check_ingush_text", "check_spelling", "report_error"]
     assert all(r["client"] == "pytest-client" and r["ip"] and r["found"] is True for r in rows)
     by = {r["tool"]: r for r in rows}
     assert by["translation_context"]["q"] == "Как ты себя чувствуешь?"
+    # translate_draft: короткий текст (≤ 60) — в журнале, как у остальных; длина, направление, незнакомые слова
+    assert by["translate_draft"]["q"] == "У него доброе сердце." and by["translate_draft"]["chars"] == 21
+    assert by["translate_draft"]["direction"] == "ru2inh"
+    assert by["translate_draft"]["unknown"] == ["хьозазаза"]
+    assert by["search_terms"]["terms"] == 3 and by["search_terms"]["unknown"] == ["хьозазаза"]
+    # из сообщения об ошибке — слово и длина, текста жалобы нет
+    assert by["report_error"]["q"] == "дог" and "неверный" not in json.dumps(by["report_error"], ensure_ascii=False)
     # из проверок текста — только незнакомые слова и длина, текста нет
     assert by["check_ingush_text"]["q"] == "" and by["check_ingush_text"]["unknown"] == ["хьозазаза"]
     assert by["check_ingush_text"]["chars"] > 0 and "Сона" not in json.dumps(by["check_ingush_text"], ensure_ascii=False)
@@ -535,6 +576,22 @@ def test_rate_limiter_bounded_and_shared_egress():
     assert not srv.is_shared_egress("not-an-ip")
 
 
+def test_rate_limit_message_names_the_applied_limit(client, site, monkeypatch):
+    # адрес из общей сети облачного клиента — в тексте ошибки его лимит, а не лимит одиночного адреса
+    srv.state().context_limiter = srv.RateLimiter(1, shared_per_minute=2)
+    monkeypatch.setattr(srv, "is_shared_egress", lambda ip: True)
+    for rid in (2, 3):
+        assert call(client, "translation_context", {"question": f"вопрос {rid}"}, rid)["isError"] is False
+    res = call(client, "translation_context", {"question": "вопрос 4"}, 4)
+    assert res["isError"] is True and "Rate limit: 2 " in res["content"][0]["text"]
+    monkeypatch.setattr(srv, "is_shared_egress", lambda ip: False)
+    srv.state().report_limiter = srv.RateLimiter(1, shared_per_minute=30, window=3600.0, unit="hour")
+    for rid in (5, 6):
+        call(client, "report_error", {"word": "дог", "problem": f"ошибка {rid}"}, rid)
+    res = call(client, "report_error", {"word": "дог", "problem": "ошибка 7"}, 7)
+    assert "Rate limit: 1 report_error calls per hour" in res["content"][0]["text"]
+
+
 def test_clients_lru_bounded():
     c = srv.Clients()
     c.MAX_KEYS = 100
@@ -567,3 +624,358 @@ def test_single_source_rule():
     # 24.11.2026: «амасти» — «фея» только в БДИМТ09; помощник должен это назвать
     assert "exactly ONE code in `sources`" in srv.INSTRUCTIONS
     assert "только в БДИМТ09" in srv.ingush_assistant("")
+
+
+def test_semantic_examples_shape_and_tool(client, site):
+    out = srv.shape_semantic_examples(fixture("semantic_examples"), "как ты себя чувствуешь")
+    assert out["translation_legend"] == srv.TRANSLATION_LEGEND
+    assert out["found"] is True and out["mode"] == "semantic" and len(out["examples"]) == 2
+    assert out["examples"][0]["url"] == "https://paydadosh.ru/books/read/pliev_khala_urkhe_1974/web/#p=298"
+    assert out["examples"][1]["url"].endswith("&smysl=1")
+    assert _urls_everywhere(out) == []
+
+    res = call(client, "find_examples", {"word": "как ты себя чувствуешь", "mode": "semantic"})
+    assert res["isError"] is False and res["structuredContent"]["mode"] == "semantic"
+    assert site.calls[-1] == ("/api/mcp-feed/v1/semantic-examples", {"q": "как ты себя чувствуешь", "limit": "5"})
+    # ревью 27.11: машинный перевод корпуса — с легендой и оговоркой «черновик, не проверен носителем»
+    assert "не проверен носителем" in out["translation_legend"]["draft"]
+    raw = fixture("semantic_examples")
+    raw["items"][1]["prov"] = "machine_draft"
+    draft = srv.shape_semantic_examples(raw, "как ты себя чувствуешь")
+    assert draft["examples"][1]["translation"] == "draft" and "не проверен носителем" in draft["note"]
+    assert "draft" not in out.get("note", "")
+
+
+def test_semantic_global_budget(client, site, tmp_path):
+    """Общий потолок поиска по смыслу на весь сервер: исчерпан — ответ без примеров, сайт не зовём, не в кэш."""
+    srv.state().semantic_budget = srv.GlobalBudget(per_minute=1, per_day=100)
+    assert call(client, "find_examples", {"word": "пойти в гости", "mode": "semantic"})["structuredContent"]["found"]
+    n = len(site.calls)
+    out = call(client, "find_examples", {"word": "доброе сердце", "mode": "semantic"}, rid=3)["structuredContent"]
+    assert out["found"] is False and out["limited"] == "minute" and "lexical" in out["note"]
+    assert len(site.calls) == n
+    srv.state().semantic_budget = srv.GlobalBudget(per_minute=10, per_day=100)
+    assert call(client, "find_examples", {"word": "доброе сердце", "mode": "semantic"}, rid=4)["structuredContent"]["found"]
+    # сайт сказал «лимит» (его потолок: контекст + поиск по смыслу) — тот же ответ
+    lim = srv.shape_semantic_examples({"available": False, "limited": True, "items": []}, "x")
+    assert lim["limited"] == "minute" and "исчерпан" in lim["note"]
+    # лексический поиск потолком не считается
+    srv.state().semantic_budget = srv.GlobalBudget(per_minute=0, per_day=0)
+    assert call(client, "find_examples", {"word": "дог"}, rid=5)["isError"] is False
+
+
+def test_semantic_examples_404_graceful_and_not_cached(client, site):
+    orig = MISS.pop("/api/mcp-feed/v1/semantic-examples")
+    try:
+        r1 = call(client, "find_examples", {"word": "пойти в гости", "mode": "semantic"})
+        r2 = call(client, "find_examples", {"word": "пойти в гости", "mode": "semantic"}, rid=3)
+    finally:
+        MISS["/api/mcp-feed/v1/semantic-examples"] = orig
+    assert r1["isError"] is False and r1["structuredContent"]["found"] is False
+    assert r1["structuredContent"]["available"] is False
+    assert "lexical" in r1["structuredContent"]["note"]
+    assert len(site.calls) == 2   # недоступность не кэшируется
+
+
+def test_translate_draft_shape_report_url_and_rate_limit(client, site, tmp_path):
+    raw = fixture("translate_draft")
+    out = srv.fit(srv.display(srv.shape_translate_draft(raw, truncated=False)))
+    assert out["found"] is True and out["draft"] is True and "не проверен носителем" in out["draft_note"]
+    assert out["translation"] == "Дог дика да цун хьозазаза."
+    assert _urls_everywhere(out) == []
+    cards = _card_items(out)
+    assert len(cards) == 3
+    for it in cards:
+        assert it["report_url"] == it["url"] + "#word-report-error"
+    # даже если все предложения совпали с правками редакции — всё равно черновик с пометкой
+    verified = srv.shape_translate_draft({**raw, "draft": False, "all_verified_by_moderator": True}, truncated=True)
+    assert verified["draft"] is True and verified["draft_note"] and "400" in verified["note"]
+    assert "не ответ носителя" in verified["note"]
+    empty = call(client, "translate_draft", {"text": "   "})["structuredContent"]
+    assert empty["draft"] is True and empty["draft_note"]
+
+    srv.state().mt_limiter = srv.RateLimiter(2)
+    assert call(client, "translate_draft", {"text": "Первая фраза."})["isError"] is False
+    assert call(client, "translate_draft", {"text": "Вторая фраза."}, rid=3)["isError"] is False
+    limited = call(client, "translate_draft", {"text": "Третья фраза."}, rid=4)
+    assert limited["isError"] is True and "Rate limit" in limited["content"][0]["text"]
+    assert journal(tmp_path)[-1]["error"] == "rate_limited"
+    # повтор из кэша лимит не тратит
+    assert call(client, "translate_draft", {"text": "Первая фраза."}, rid=5)["isError"] is False
+
+
+def test_translate_draft_long_text_not_logged(client, site, tmp_path):
+    long = "Это длинное предложение для проверки журнала, в нём заведомо больше шестидесяти знаков."
+    call(client, "translate_draft", {"text": long})
+    row = journal(tmp_path)[-1]
+    assert row["q"] == "" and row["chars"] == len(long) and "длинное" not in json.dumps(row, ensure_ascii=False)
+
+
+def test_translate_draft_global_budget_minute_and_day(client, site, tmp_path):
+    """Общий потолок на весь сервер: исчерпан — ответ без перевода (не ошибка), сайт не зовём, в кэш не кладём."""
+    srv.state().mt_budget = srv.GlobalBudget(per_minute=2, per_day=100)
+    for i, word in enumerate(("раз", "два")):
+        assert call(client, "translate_draft", {"text": word}, rid=10 + i)["structuredContent"]["found"] is True
+    n_calls = len(site.calls)
+    res = call(client, "translate_draft", {"text": "три"}, rid=20)
+    out = res["structuredContent"]
+    assert res["isError"] is False and out["found"] is False and out["limited"] == "minute"
+    assert out["translation"] == "" and out["draft"] is True and "исчерпан" in out["note"]
+    assert len(site.calls) == n_calls                       # сайт (и сервис перевода) не звали
+    assert journal(tmp_path)[-1]["limited"] == "minute"
+    srv.state().mt_budget = srv.GlobalBudget(per_minute=100, per_day=100)
+    assert call(client, "translate_draft", {"text": "три"}, rid=21)["structuredContent"]["found"] is True  # не из кэша
+
+    day = srv.GlobalBudget(per_minute=100, per_day=3)
+    assert [day.take() for _ in range(4)] == ["", "", "", "day"] and day.left_today() == 0
+    srv.state().mt_budget = day
+    assert call(client, "translate_draft", {"text": "четыре"}, rid=22)["structuredContent"]["limited"] == "day"
+
+
+def test_global_budget_env_defaults():
+    assert srv.MT_GLOBAL_PER_DAY == 500 and srv.MT_GLOBAL_PER_MINUTE == 20 and srv.MT_CONCURRENCY == 1
+    assert srv.SITE_CONCURRENCY == 2 and srv.REPORTS_PER_HOUR == 5 and srv.REPORTS_PER_DAY == 50
+
+
+def test_mt_lane_does_not_block_dictionary():
+    """Перевод — своя очередь в одно место: пока висит перевод, словарь отвечает (общие 2 места не заняты)."""
+    import asyncio
+
+    release = asyncio.Event()
+    seen: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("translate-draft"):
+            await release.wait()
+        return httpx.Response(200, json={"ok": True})
+
+    async def scenario():
+        api = srv.SiteAPI(transport=httpx.MockTransport(handler), feed_key="", concurrency=2, mt_concurrency=1)
+        t1 = asyncio.create_task(api.post("/api/mcp-feed/v1/translate-draft", {"text": "a"}, lane="mt"))
+        await asyncio.sleep(0.05)
+        # второй перевод ждёт своей очереди…
+        t2 = asyncio.create_task(api.post("/api/mcp-feed/v1/translate-draft", {"text": "b"}, lane="mt"))
+        await asyncio.sleep(0.05)
+        assert seen.count("/api/mcp-feed/v1/translate-draft") == 1
+        # …а два вызова словаря проходят сразу
+        r = await asyncio.wait_for(asyncio.gather(api.get("/api/mcp-feed/v1/search", {"q": "дог"}),
+                                                  api.get("/api/mcp-feed/v1/search", {"q": "кӀант"})), 1.0)
+        assert all(x["ok"] for x in r)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(t1, t2), 1.0)
+        await api.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_report_error_limits_and_cleanup(client, site, tmp_path):
+    srv.state().report_limiter = srv.RateLimiter(2, window=3600.0, unit="hour")
+    args = {"word": "дог", "problem": "неверный класс"}
+    assert call(client, "report_error", args)["structuredContent"]["sent"] is True
+    assert call(client, "report_error", args, rid=3)["structuredContent"]["sent"] is True   # не из кэша
+    assert sum(1 for p, _ in site.calls if p.endswith("/report")) == 2
+    res = call(client, "report_error", args, rid=4)
+    assert res["isError"] is True and "per hour" in res["content"][0]["text"]
+    # дневной потолок сервера — без вызова сайта
+    srv.state().report_limiter = srv.RateLimiter(100, window=3600.0, unit="hour")
+    srv.state().report_budget = srv.GlobalBudget(100, 0)
+    out = call(client, "report_error", args, rid=5)["structuredContent"]
+    assert out["sent"] is False and out["limited"] == "day" and "#feedback-form" in out["url"]
+    assert sum(1 for p, _ in site.calls if p.endswith("/report")) == 2
+    # сайт ответил 429 (его сутки) — тоже понятный ответ
+    srv.state().report_budget = srv.GlobalBudget(100, 100)
+    site.status["/api/mcp-feed/v1/report"] = 429
+    assert call(client, "report_error", args, rid=6)["structuredContent"]["limited"] == "day"
+    # без слова, карточки и предложения — не отправляем
+    site.status.clear()
+    out = call(client, "report_error", {"problem": "что-то не так"}, rid=7)["structuredContent"]
+    assert out["sent"] is False and "word" in out["note"]
+    # потолок сервера тратит только ушедшее сообщение: отказ сайта (400/429/сбой) и дубль его возвращают
+    budget = srv.state().report_budget = srv.GlobalBudget(100, 1)
+    site.status["/api/mcp-feed/v1/report"] = 400
+    assert call(client, "report_error", args, rid=8)["structuredContent"]["sent"] is False
+    assert budget.left_today() == 1
+    site.status.clear()
+    assert call(client, "report_error", args, rid=9)["structuredContent"]["sent"] is True
+    assert budget.left_today() == 0
+    budget.refund()
+    budget.refund()                                      # лишний возврат не уводит счёт в минус
+    assert budget.left_today() == 1
+
+
+def test_search_terms_shape_and_units(client, site):
+    out = srv.shape_search_terms(fixture("search_terms"), ["дог", "дегаш", "хьозазаза"])
+    assert out["count"] == 3 and out["found_count"] == 2 and _urls_everywhere(out) == []
+    by = {r["term"]: r for r in out["items"]}
+    assert by["дог"]["headword"] == "дог" and by["дог"]["translation"] == "сердце"
+    assert by["дог"]["report_url"].endswith("#word-report-error")
+    assert by["дегаш"]["headword"] == "дог" and "словоформа" in by["дегаш"]["note"]
+    assert by["хьозазаза"]["found"] is False and by["хьозазаза"]["suggestions_note"] == "возможно, имелось в виду"
+    # лимит — в единицах ⌈N/5⌉: 10 единиц — это 50 слов одним вызовом, следующий не проходит
+    srv.state().batch_limiter = srv.RateLimiter(10)
+    assert call(client, "search_terms", {"terms": [f"слово{i}" for i in range(50)]})["isError"] is False
+    res = call(client, "search_terms", {"terms": ["дог"]}, rid=3)
+    assert res["isError"] is True and "units" in res["content"][0]["text"]
+    lim = srv.RateLimiter(5)
+    assert lim.allow("a", cost=3) and not lim.allow("a", cost=3) and lim.allow("a", cost=2)
+    too_many = call(client, "search_terms", {"terms": ["x"] * 51}, rid=4)
+    assert too_many["isError"] is True
+    # не успели за время пакета — skipped (это не «нет в словаре»), такой ответ не кэшируется
+    raw = {"items": [*fixture("search_terms")["items"], {"q": "кӀант", "found": False, "skipped": True}]}
+    out = srv.shape_search_terms(raw, ["дог", "дегаш", "хьозазаза", "кӀант"])
+    by = {r["term"]: r for r in out["items"]}
+    assert by["кӀант"]["skipped"] is True and out["skipped_count"] == 1 and "skipped=true" in out["note"]
+    assert "found=false" in out["note"]                           # «хьозазаза» — настоящий промах
+    assert srv.BATCH_UNITS_PER_MINUTE == 20 and srv.SHARED_BATCH_UNITS_PER_MINUTE == 60
+
+
+def test_batch_lane_does_not_block_dictionary():
+    """Пакет — своя очередь в одно место: пока висит пакет, словарь отвечает."""
+    import asyncio
+
+    release = asyncio.Event()
+    seen: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("search-batch"):
+            await release.wait()
+        return httpx.Response(200, json={"ok": True})
+
+    async def scenario():
+        api = srv.SiteAPI(transport=httpx.MockTransport(handler), feed_key="", concurrency=2, batch_concurrency=1)
+        t1 = asyncio.create_task(api.post("/api/mcp-feed/v1/search-batch", {"terms": ["a"]}, lane="batch"))
+        t2 = asyncio.create_task(api.post("/api/mcp-feed/v1/search-batch", {"terms": ["b"]}, lane="batch"))
+        await asyncio.sleep(0.05)
+        assert seen.count("/api/mcp-feed/v1/search-batch") == 1
+        r = await asyncio.wait_for(asyncio.gather(api.get("/api/mcp-feed/v1/search", {"q": "дог"}),
+                                                  api.get("/api/mcp-feed/v1/search", {"q": "кӀант"})), 1.0)
+        assert all(x["ok"] for x in r)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(t1, t2), 1.0)
+        await api.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_numbers_shape():
+    out = srv.shape_numbers(fixture("numbers_44"))
+    assert out["cardinal"] == "шовзткъе диъ" and out["ordinal"] == "шовзткъе диълагӏа"
+    assert out["url"] == "https://paydadosh.ru/numbers" and "класса д" in out["class_note"]
+    # ревью 27.11: 4, 14, 80 и составные меняются по классу — не «количественные по классам не меняются»
+    assert out["class_variable"] == ["диъ", "диълагӏа"] and "не меняются" not in out["class_note"]
+    assert "class_warning" not in out
+    warn = srv.shape_numbers({**fixture("numbers_44"), "class": "в"})
+    assert "класса в" in warn["class_warning"] and "диъ" in warn["class_warning"]
+    miss = srv.shape_numbers({"n": "1" + "0" * 21, "found": False, "error": "too_large"})
+    assert miss["found"] is False and "10^21" in miss["note"]
+
+
+def test_number_to_words_schema_string_and_any_class(client, site):
+    init(client)
+    tools = {t["name"]: t for t in rpc(client, "tools/list", {}, 3).json()["result"]["tools"]}
+    props = tools["number_to_words"]["inputSchema"]["properties"]
+    assert props["number"]["type"] == "string" and props["number"]["pattern"] == r"^\d{1,21}$"
+    assert "" not in props["noun_class"]["enum"] and props["noun_class"]["default"] == "any"
+    # целое из JSON тоже принимается (как строка); 21 цифра — без округления
+    call(client, "number_to_words", {"number": 44}, rid=4)
+    assert site.calls[-1] == ("/api/mcp-feed/v1/numbers", {"n": "44"})
+    call(client, "number_to_words", {"number": "999999999999999999999", "noun_class": "в"}, rid=5)
+    assert site.calls[-1] == ("/api/mcp-feed/v1/numbers", {"n": "999999999999999999999", "cls": "в"})
+    assert call(client, "number_to_words", {"number": "1e21"}, rid=6)["isError"] is True
+    assert call(client, "number_to_words", {"number": "-5"}, rid=7)["isError"] is True
+
+
+def test_did_you_mean_on_misses():
+    out = srv.shape_search(fixture("search_miss"), "хьозазаза")
+    if out.get("suggestions"):
+        assert out["suggestions_note"] == "возможно, имелось в виду" and "возможно, имелось в виду" in out["note"]
+    raw = {"entries": [], "suggestions": ["дог", "дагь"]}
+    out = srv.shape_search(raw, "дуог")
+    assert [s["word"] for s in out["suggestions"]] == ["дог", "дагь"] and out["suggestions_note"]
+    assert "Возможно, имелось в виду: дог, дагь" in out["note"]
+    ana = srv.shape_analysis(fixture("razbor_miss"), "хьозазаза")
+    assert ana["suggestions_note"] == "возможно, имелось в виду" and "имелось в виду" in ana["note"]
+    # ревью 27.11: строка карточки «заголовок (формы) — толкование» → голый заголовок, и в ссылке тоже
+    out = srv.shape_search({"entries": [], "suggestions": ["дог (дийна, дега) — сердце", "дог — сердце", "дагь"]}, "дуог")
+    assert [s["word"] for s in out["suggestions"]] == ["дог", "дагь"]
+    assert out["suggestions"][0]["url"] == "https://paydadosh.ru/?q=%D0%B4%D0%BE%D0%B3"
+
+
+def test_context_parity_blocks():
+    raw = fixture("context_feel")
+    raw.update({
+        "ready_answers": [{"kind": "phrasebook", "source": "разговорник", "use": "verbatim",
+                           "text": "Мишта хет хьона? — Как ты себя чувствуешь? [разговорник]", "path": "/phrasebook/1-x"},
+                          {"kind": "qa", "source": "«Хаттараш»", "use": "reference", "text": "вопрос …", "path": "/ask/5"}],
+        "paradigms": "Парадигмы слов (формы из словаря…):\n  • дог (сущ.) — …",
+        "article_examples": ["пример из статьи"],
+        "stories": [{"ing": "абзац", "ru": "абзац", "title": "Рассказ", "path": "/stories"}],
+        "untranslated_corpus": [{"ing": "предложение", "source": "КОД21", "note": "…"}],
+        "dictionary": [{"term": "дог", "definitions": ["сердце"], "sources": [], "path": "/word/1-дог",
+                        "examples": [{"ing": "Дог дика да цун", "ru": "У него доброе сердце"}]}],
+    })
+    out = srv.shape_context(raw, "Как ты себя чувствуешь?")
+    assert out["ready_answers"][0]["url"] == "https://paydadosh.ru/phrasebook/1-x"
+    assert out["ready_answers"][1]["url"] == "https://paydadosh.ru/ask/5"
+    assert out["paradigms"].startswith("Парадигмы слов") and out["article_examples"] and out["stories"]
+    assert out["untranslated_corpus"][0]["url"].startswith("https://paydadosh.ru/corpus?q=")
+    assert out["dictionary"][0]["examples"][0]["url"] == out["dictionary"][0]["url"]
+    assert out["order"].startswith("ready_answers") and _urls_everywhere(out) == []
+
+
+def test_traps_flag_off_by_default(client, site, monkeypatch):
+    assert srv.EXPOSE_TRAPS is False
+    got = rpc(client, "prompts/get", {"name": "ingush_assistant", "arguments": {}}, 4).json()
+    text = got["result"]["messages"][0]["content"]["text"]
+    assert srv.TRAPS_HEADING.upper() not in text
+    assert not any(p.endswith("/traps") for p, _ in site.calls)          # сайт не спрашивали
+    monkeypatch.setattr(srv, "EXPOSE_TRAPS", True)
+    got = rpc(client, "prompts/get", {"name": "ingush_assistant", "arguments": {}}, 5).json()
+    text = got["result"]["messages"][0]["content"]["text"]
+    assert srv.TRAPS_HEADING.upper() in text and "время (й)" in text
+    rpc(client, "prompts/get", {"name": "ingush_assistant", "arguments": {}}, 6)
+    assert sum(1 for p, _ in site.calls if p.endswith("/traps")) == 1     # кэш на час
+
+
+# Внутренние имена и адреса в публичных файлах: сам список здесь НЕ лежит ни строкой, ни хэшем (короткие строки по
+# хэшу восстанавливаются перебором за секунды). Его задаёт окружение MCP_FORBIDDEN_STRINGS (через запятую) — CI и
+# проверка перед публикацией закрытого репозитория; без переменной сторож пропускается.
+def _forbidden_strings() -> list[str]:
+    import os
+
+    return [x for x in (y.strip().lower() for y in os.getenv("MCP_FORBIDDEN_STRINGS", "").split(",")) if x]
+
+
+def _forbidden_hits(text: str, forbidden: list[str]) -> list[str]:
+    """Позиции запретных строк в тексте (без регистра); сами строки в ответ не попадают."""
+    low = text.lower()
+    return [f"#{n}@{low.index(x)}" for n, x in enumerate(forbidden) if x in low]
+
+
+def _public_files(root: Path) -> list[Path]:
+    skip = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", "data"}
+    return sorted(p for p in root.rglob("*") if p.is_file() and not skip & set(p.relative_to(root).parts))
+
+
+def test_no_internal_infra_mentions_in_public_mcp_server():
+    forbidden = _forbidden_strings()
+    if not forbidden:
+        pytest.skip("MCP_FORBIDDEN_STRINGS не задана")
+    for path in _public_files(HERE):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        assert _forbidden_hits(text, forbidden) == [], path.relative_to(HERE)
+
+
+def test_forbidden_guard_works(tmp_path):
+    # сама проверка: строка ловится в любом регистре; служебные каталоги не читаются
+    assert _forbidden_hits("text QwXyZ text", ["qwxyz"]) == ["#0@5"]
+    assert _forbidden_hits("paydadosh.ru", ["qwxyz"]) == []
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "x.py").write_text("qwxyz", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("data/", encoding="utf-8")
+    assert [p.name for p in _public_files(tmp_path)] == [".gitignore"]

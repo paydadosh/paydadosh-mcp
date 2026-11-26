@@ -1,0 +1,37 @@
+{
+ "direction": "auto",
+ "items": [
+  {
+   "q": "дог",
+   "found": true,
+   "entry": {
+    "id": 104869,
+    "term": "дог",
+    "pos": "сущ.",
+    "definition": "сердце",
+    "sources": [
+     "БДИМТ09",
+     "КУР05"
+    ],
+    "path": "/word/104869-дог",
+    "noun_class": "д, д"
+   }
+  },
+  {
+   "q": "дегаш",
+   "found": true,
+   "wordform_of": {
+    "lemma": "дог",
+    "pos": "NOUN",
+    "path": "/word/104869-дог"
+   }
+  },
+  {
+   "q": "хьозазаза",
+   "found": false,
+   "suggestions": [
+    "хьоза"
+   ]
+  }
+ ]
+}
